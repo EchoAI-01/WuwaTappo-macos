@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 应用显示名（菜单栏/Dock）；Tauri 会用 productName 生成，这里显式固定为 WuwaTappo -->
+	<key>CFBundleName</key>
+	<string>WuwaTappo</string>
+	<key>CFBundleDisplayName</key>
+	<string>WuwaTappo</string>
+	<!-- 对应 Windows 版 skipTaskbar：桌宠不占 Dock，仅保留托盘入口 -->
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>

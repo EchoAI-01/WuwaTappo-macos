@@ -1,0 +1,13 @@
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# macOS
+.DS_Store
+
+# Node（如后续引入前端工具链）
+node_modules/
+
+# 日志与临时文件
+*.log
+*.tmp
