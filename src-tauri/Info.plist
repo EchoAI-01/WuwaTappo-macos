@@ -10,5 +10,23 @@
 	<!-- 对应 Windows 版 skipTaskbar：桌宠不占 Dock，仅保留托盘入口 -->
 	<key>LSUIElement</key>
 	<true/>
+
+	<!-- ===== macOS 权限声明（CGEventTap + WKWebView 需要）===== -->
+
+	<!-- 辅助功能权限（CGEventTap 全局键鼠监听的核心依赖）-->
+	<!-- macOS 上 AXIsProcessTrusted / CGEventTapCreate 需要 Accessibility 授权 -->
+	<key>NSAccessibilityUsageDescription</key>
+	<string>WuwaTappo 需要辅助功能权限来监听全局鼠标和键盘事件，用于桌宠拖拽、点击互动和按键计数。所有输入事件仅在桌宠窗口区域内响应，不会上传任何输入内容。</string>
+
+	<!-- 输入监控（某些 macOS 版本上 CGEventTap 也需要）-->
+	<key>NSInputMonitoringUsageDescription</key>
+	<string>WuwaTappo 需要输入监控权限来监听全局鼠标和键盘事件，用于桌宠拖拽、点击互动和按键计数。所有输入事件仅在桌宠窗口区域内响应，不会上传任何输入内容。</string>
+
+	<!-- WKWebView / 网络 -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

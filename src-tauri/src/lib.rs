@@ -260,6 +260,20 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// 诊断双写：stdout + /tmp/wuwatappo-diag.log。
+/// 正常（LaunchServices）启动的 app stdout 被丢弃，诊断必须落文件。
+pub fn dlog(msg: &str) {
+    println!("{msg}");
+    use std::io::Write as _;
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/wuwatappo-diag.log")
+    {
+        let _ = writeln!(f, "[{}] {}", chrono_time(), msg);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 桌宠主窗口管理命令（11 个，藏于前端 kt() 封装之后，阶段 2 挖掘补全）
 // macOS 策略：Win32 区域命中/鼠标吞噬等专属技巧按语义降级映射
@@ -273,6 +287,9 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// macOS 照搬恒穿透；同时把前端上报的区域存入 SharedMainHitState，
 /// 供 input.rs 的 mouse-button 路由做 per-region 命中过滤
 /// （官方 Windows 的 WM_NCHITTEST 等价：只有命中桌宠区域的鼠标事件才进桥）。
+/// 注意：这里不再调 set_ignore_cursor_events —— 恒穿透由启动时的
+/// set_main_force_cursor_ignore(true) 设置；此处重复调用一旦失败会让整个命令
+/// 返回 Err，前端随即报 hit_region_sync failed 并跳过后续区域同步。
 #[tauri::command]
 fn set_main_hit_region<R: Runtime>(
     app: AppHandle<R>,
@@ -287,27 +304,46 @@ fn set_main_hit_region<R: Runtime>(
         #[serde(default)]
         input_regions: Option<serde_json::Value>,
     }
+    // 诊断：完整 payload 双写（定位前端上报内容）
+    dlog(&format!("[hit-region] payload: {payload}"));
     let p: P = serde_json::from_value(payload)
         .map_err(|e| format!("set_main_hit_region payload: {e}"))?;
     let visual = input::parse_regions(p.regions.as_ref());
     let inputs = input::parse_regions(p.input_regions.as_ref());
+    dlog(&format!(
+        "[hit-region] parsed: {} visual, {} input regions",
+        visual.len(),
+        inputs.len()
+    ));
     *app.state::<input::SharedMainHitState>().0.lock().unwrap() = input::MainHitState {
         input_regions: inputs,
         visual_regions: visual,
     };
-    if let Some(win) = app.get_webview_window("main") {
-        win.set_ignore_cursor_events(true).map_err(|e| e.to_string())?;
-    }
+    // 同步刷新几何缓存：前端每次布局/显隐变化都会上报区域，
+    // 顺带把 main/辅助窗口的最新外框写进 tap 线程可读的快照
+    input::refresh_main_geom(&app);
     Ok(())
 }
 
 /// 强制全窗光标穿透（全屏拖拽冻结恢复等场景）
 #[tauri::command]
 fn set_main_force_cursor_ignore<R: Runtime>(app: AppHandle<R>, enabled: bool) -> Result<(), String> {
-    println!("[cmd] set_main_force_cursor_ignore");
+    dlog("[cmd] set_main_force_cursor_ignore");
+    // 记录前端"希望全窗穿透"的期望，但实际穿透值还要看指针位置：
+    // 指针悬停在桌宠区域时必须保持可点击（否则点击会穿透到桌面）。
+    let in_pet = {
+        let geom_state = app.state::<input::SharedMainGeom>();
+        let Ok(mut g) = geom_state.0.lock() else {
+            return Ok(());
+        };
+        g.front_force_ignore = enabled;
+        g.pointer_in_pet
+    };
     if let Some(win) = app.get_webview_window("main") {
-        win.set_ignore_cursor_events(enabled).map_err(|e| e.to_string())?;
+        win.set_ignore_cursor_events(enabled && !in_pet)
+            .map_err(|e| e.to_string())?;
     }
+    input::refresh_main_geom(&app);
     Ok(())
 }
 
@@ -362,6 +398,7 @@ fn set_main_window_content_bounds<R: Runtime>(
     }
     win.set_size(tauri::LogicalSize::new(p.width, p.height))
         .map_err(|e| e.to_string())?;
+    input::refresh_main_geom(&app);
     Ok(())
 }
 
@@ -400,6 +437,7 @@ fn sync_main_window_to_current_monitor<R: Runtime>(app: AppHandle<R>) -> Result<
         win.set_position(tauri::LogicalPosition::new(cx, cy))
             .map_err(|e| e.to_string())?;
     }
+    input::refresh_main_geom(&app);
     Ok(())
 }
 
@@ -655,18 +693,29 @@ fn create_aux_window_min<R: Runtime>(
     .transparent(true)
     .resizable(resizable)
     .shadow(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
     .build()?;
+    // 辅助窗口必须浮到 main 透明壳之上，否则被 main 的 alwaysOnTop 盖住。
+    // 注意：不要设 set_background_color —— 辅助窗口是 transparent + 圆角卡片，
+    // 给窗口铺底色会在圆角外露出方形色块（已踩坑回滚）。
+    if let Some(win) = app.get_webview_window(label) {
+        let _ = win.show();
+        let _ = win.set_focus();
+        let _ = win.set_always_on_top(true);
+    }
+    input::refresh_main_geom(app);
     Ok(())
 }
 
 /// 打开/聚焦 panel 窗口（前端 dock-open-panel 链路的 Rust 落点）。
-/// 初始 1040x720：panel 是自绘 resize handle 的无边框窗口，880x640 时
-/// 内容（含右上角关闭按钮）显示不全，需手动拉大才完整。
-/// min 与初始一致：panel 前端 UI 非响应式（小窗口内容被裁切），
-/// 限制不可缩小于 1040x720，保证任意合法窗口尺寸下 UI 完整显示；
-/// 折叠功能是 panel 内部 CSS 类切换（module-panel--collapsed），
-/// 不依赖窗口缩小，不受 min 限制影响。
-const PANEL_SIZE: (f64, f64, f64, f64) = (1040.0, 720.0, 1040.0, 720.0);
+/// panel 前端 CSS 为固定设计尺寸：.module-panel 高 756px + 边框圆角，
+/// overflow:hidden —— 窗口小于该尺寸时内容被直接裁切（右上角关闭按钮、
+/// 物品网格第三行消失，flex 布局挤压变形）。
+/// 初始与 min 均取 1240x800：高于 756 设计高并留出呼吸空间，
+/// 宽度覆盖 243px 侧栏 + 内容区；折叠是 panel 内部 CSS 类切换
+/// （module-panel--collapsed），不依赖窗口缩小，不受 min 限制影响。
+const PANEL_SIZE: (f64, f64, f64, f64) = (1240.0, 800.0, 1240.0, 800.0);
 
 fn open_panel<R: Runtime>(app: &AppHandle<R>, tab: &str) -> tauri::Result<()> {
     let (w, h, mw, mh) = PANEL_SIZE;
@@ -681,7 +730,7 @@ fn open_panel_window<R: Runtime>(
     app: AppHandle<R>,
     payload: Option<serde_json::Value>,
 ) -> Result<(), String> {
-    println!("[cmd] open_panel_window");
+    dlog("[cmd] open_panel_window");
     let tab = payload
         .as_ref()
         .and_then(|p| p.get("tab"))
@@ -697,7 +746,7 @@ fn open_panel_window<R: Runtime>(
 
 #[tauri::command]
 fn close_panel_window<R: Runtime>(app: AppHandle<R>) {
-    println!("[cmd] close_panel_window");
+    dlog("[cmd] close_panel_window");
     if let Some(win) = app.get_webview_window("panel") {
         let _ = win.close();
     }
@@ -706,7 +755,7 @@ fn close_panel_window<R: Runtime>(app: AppHandle<R>) {
 /// panel 浮到桌宠之上（宠物会遮挡面板时的层级修正）
 #[tauri::command]
 fn raise_panel_window_above_pets<R: Runtime>(app: AppHandle<R>) {
-    println!("[cmd] raise_panel_window_above_pets");
+    dlog("[cmd] raise_panel_window_above_pets");
     if let Some(win) = app.get_webview_window("panel") {
         let _ = win.set_always_on_top(true);
         let _ = win.set_focus();
@@ -719,7 +768,7 @@ fn set_panel_window_collapsed<R: Runtime>(
     app: AppHandle<R>,
     payload: serde_json::Value,
 ) -> Result<(), String> {
-    println!("[cmd] set_panel_window_collapsed");
+    dlog("[cmd] set_panel_window_collapsed");
     let collapsed = payload
         .get("collapsed")
         .and_then(|v| v.as_bool())
@@ -735,15 +784,17 @@ fn open_login_window<R: Runtime>(
     intent: Option<String>,
     compact: Option<bool>,
 ) -> Result<(), String> {
-    println!("[cmd] open_login_window");
+    dlog("[cmd] open_login_window");
     let _ = (intent, compact);
-    create_aux_window(&app, "login", "/login", "WuwaTappo", 400.0, 620.0, false)
+    // 前端 login 卡片固定 500x378（login-CBA3ItgU.css），窗口必须容得下，
+    // 之前给 400x620 会把卡片右边裁掉 100px
+    create_aux_window(&app, "login", "/login", "WuwaTappo", 520.0, 440.0, false)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn close_login_window<R: Runtime>(app: AppHandle<R>) {
-    println!("[cmd] close_login_window");
+    dlog("[cmd] close_login_window");
     if let Some(win) = app.get_webview_window("login") {
         let _ = win.close();
     }
@@ -754,7 +805,7 @@ fn resize_login_window_to_content<R: Runtime>(
     app: AppHandle<R>,
     payload: serde_json::Value,
 ) -> Result<(), String> {
-    println!("[cmd] resize_login_window_to_content");
+    dlog("[cmd] resize_login_window_to_content");
     let w = payload.get("width").and_then(|v| v.as_f64()).unwrap_or(400.0);
     let h = payload.get("height").and_then(|v| v.as_f64()).unwrap_or(620.0);
     if let Some(win) = app.get_webview_window("login") {
@@ -958,7 +1009,7 @@ pub struct InputBridgeReady(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 #[tauri::command]
 fn notify_input_bridge_ready<R: Runtime>(app: AppHandle<R>) {
-    println!("[cmd] notify_input_bridge_ready");
+    dlog("[cmd] notify_input_bridge_ready");
     input::mark_input_bridge_ready(&app);
 }
 
@@ -1121,6 +1172,7 @@ pub fn run() {
             use tauri::tray::TrayIconBuilder;
             app.manage(SharedTrayState(Mutex::new(TrayState::default())));
             app.manage(input::SharedMainHitState(Mutex::new(input::MainHitState::default())));
+            app.manage(input::SharedMainGeom(Mutex::new(input::MainGeom::default())));
             app.manage(InputBridgeReady(std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             )));
@@ -1148,21 +1200,122 @@ pub fn run() {
             rebuild_tray_menu(app.handle(), &st)?;
 
             // main 窗口初始设置：多工作区可见（桌宠惯例）
+            // + 启动时立即强制全窗光标穿透兜底——前端初始化链理论上会调
+            //   set_main_force_cursor_ignore(true)，但如果因任何原因中断，
+            //   这里兜底避免 main 窗口短暂接收原生点击导致穿透异常
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.set_visible_on_all_workspaces(true);
+                let _ = win.set_ignore_cursor_events(true);
             }
+            // 几何缓存初始值（tap 命中测试只读缓存，主线程负责刷新）
+            input::refresh_main_geom(app.handle());
 
             // 全局键鼠监听（key-press/key-release/mouse-move 事件源；
             // 辅助功能授权后自动生效，未授权时仅日志提示不影响启动）
             input::start(app.handle().clone());
+
+            // TEMP-DEBUG：WUWA_OPEN_LOGIN=1 时自动打开 login 窗口，便于验证可见性
+            if std::env::var("WUWA_OPEN_LOGIN").is_ok() {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(4));
+                    let _ = create_aux_window(
+                        &h, "login", "/login", "WuwaTappo", 400.0, 620.0, false,
+                    );
+                    println!("[debug] auto-open login window");
+                });
+            }
+
+            // keep-alive + 窗口/状态诊断。
+            // keep-alive（关键修复）：WKWebView 会对"无活动"的页面执行 idle 挂起
+            // （JS 冻结、timer 停转）——用户点击登录/加入房间后注意力转移到辅助窗口，
+            // main 页面随即被挂起，表现为"按键统计停止、桌宠无响应"。
+            // 每 5 秒注入一次零副作用 eval 维持页面活跃。
+            // 诊断部分（前 2 分钟）把窗口几何与 hit state 双写 /tmp/wuwatappo-diag.log。
+            {
+                let app2 = app.handle().clone();
+                std::thread::spawn(move || {
+                    for i in 0..24 {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        // keep-alive：静默 eval，零副作用
+                        if let Some(w) = app2.get_webview_window("main") {
+                            let _ = w.eval("void 0");
+                        }
+                        // keep-alive 对辅助窗口同样适用（panel/login 也会被挂起）
+                        for (label, w) in app2.webview_windows() {
+                            if label != "main" {
+                                let _ = w.eval("void 0");
+                            }
+                        }
+                        let wins = app2.webview_windows();
+                        let mut lines = Vec::new();
+                        for (label, w) in &wins {
+                            let pos = w
+                                .outer_position()
+                                .map(|p| format!("{},{}", p.x, p.y))
+                                .unwrap_or_else(|e| e.to_string());
+                            let size = w
+                                .outer_size()
+                                .map(|s| format!("{}x{}", s.width, s.height))
+                                .unwrap_or_else(|e| e.to_string());
+                            let vis = w.is_visible().map(|v| v.to_string()).unwrap_or("?".into());
+                            lines.push(format!("{label}: pos=({pos}) size={size} visible={vis}"));
+                        }
+                        let ready = app2
+                            .try_state::<InputBridgeReady>()
+                            .map(|s| s.0.load(std::sync::atomic::Ordering::Acquire))
+                            .unwrap_or(false);
+                        let regions = app2
+                            .try_state::<input::SharedMainHitState>()
+                            .map(|s| {
+                                let st = s.0.lock().unwrap();
+                                format!("{}in/{}vis", st.input_regions.len(), st.visual_regions.len())
+                            })
+                            .unwrap_or_else(|| "?".into());
+                        dlog(&format!(
+                            "[diag#{i}] bridge_ready={ready} regions={regions} windows: {}",
+                            lines.join(" | ")
+                        ));
+                    }
+                    // 2 分钟后仅保留 keep-alive（不写日志）
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        for (_, w) in app2.webview_windows() {
+                            let _ = w.eval("void 0");
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         // WKWebView 默认右键菜单（Reload/Back 等）不符合桌面应用观感；
         // 官方前端仅对桌宠 dock 区域做 contextmenu preventDefault（$p），
         // 这里对所有窗口统一屏蔽。桌宠右键菜单由前端基于 mouse-button
         // 事件调 popup_main_dock_context_menu 弹原生菜单。
+        // 同时注入前端诊断钩子：onerror/unhandledrejection 捕获 + 10s 心跳，
+        // 全部经 write_app_log 落盘（WKWebView 的 console 不可见）。
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                let _ = webview.eval(
+                    r#"
+(function(){
+  if (window.__wuwadiag) return; window.__wuwadiag = 1;
+  var inv = null;
+  try { inv = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke; } catch(e){}
+  function w(m){ try { inv && inv('write_app_log', {level:'error', message:'[diag] '+m}); } catch(e){} }
+  window.addEventListener('error', function(e){
+    w('onerror: ' + (e.message||'?') + ' @' + (e.filename||'') + ':' + (e.lineno||0) +
+      (e.error && e.error.stack ? ' | ' + String(e.error.stack).slice(0,600) : ''));
+  }, true);
+  window.addEventListener('unhandledrejection', function(e){
+    var r = e.reason;
+    w('unhandled: ' + (r && r.stack ? String(r.stack).slice(0,600) : (r && r.message) || String(r)));
+  });
+  setInterval(function(){ w('heartbeat ' + location.hash + ' ts=' + Date.now()); }, 10000);
+  w('diag installed ' + location.hash + ' ts=' + Date.now());
+})();
+"#,
+                );
                 let _ = webview.eval(
                     "document.addEventListener('contextmenu', e => e.preventDefault(), { capture: true });",
                 );

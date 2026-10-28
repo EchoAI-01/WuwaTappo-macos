@@ -63,7 +63,9 @@ pub struct MainHitState {
 
 pub struct SharedMainHitState(pub std::sync::Mutex<MainHitState>);
 
-/// 宽松解析前端 regions 数组：字段值可能是数字或字符串数字，含 href 等附加字段忽略
+/// 宽松解析前端 regions 数组：字段值可能是数字或字符串数字，含 href 等附加字段忽略。
+/// 横坐标兼容 x / left、纵坐标兼容 y / top（实测前端上报的是 left/top——
+/// 2026-10-28 诊断日志实锤：只认 x/y 时 parsed 恒为 0，桌宠点击/拖拽全灭）
 pub fn parse_regions(v: Option<&serde_json::Value>) -> Vec<RegionRect> {
     let mut out = Vec::new();
     if let Some(arr) = v.and_then(|x| x.as_array()) {
@@ -74,9 +76,13 @@ pub fn parse_regions(v: Option<&serde_json::Value>) -> Vec<RegionRect> {
                         .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
                 })
             };
-            if let (Some(x), Some(y), Some(w), Some(h)) =
-                (f("x"), f("y"), f("width"), f("height"))
-            {
+            let coord = |primary: &str, alt: &str| f(primary).or_else(|| f(alt));
+            if let (Some(x), Some(y), Some(w), Some(h)) = (
+                coord("x", "left"),
+                coord("y", "top"),
+                f("width"),
+                f("height"),
+            ) {
                 out.push(RegionRect { x, y, w, h });
             }
         }
@@ -88,64 +94,132 @@ pub fn parse_regions(v: Option<&serde_json::Value>) -> Vec<RegionRect> {
 // mouse-button 路由（官方 per-region 语义的 macOS 等价）
 // ---------------------------------------------------------------------------
 
-/// mouse-down 是否路由给 main 的原生输入桥。
-/// 官方 Windows：Win32 per-region hit test，仅桌宠实体/交互区域的事件
-/// 进入 native input POC。macOS 等价判断（主线程）：
-/// 1. 点在 main 窗口内且 main 可见；
-/// 2. 点不在本进程其他可见窗口（login/panel/about/toast 等）内——
-///    否则点击属于那个窗口，不能让穿透层误响应；
-/// 3. 点命中 input_regions 或 visual_regions。
-/// mouse-up 不过滤：拖拽/手势收尾必须总能送达。
-fn route_mouse_press(app: &AppHandle, gx: f64, gy: f64) -> bool {
-    let Some(main) = app.get_webview_window("main") else {
-        return false;
-    };
-    if !main.is_visible().unwrap_or(false) {
-        return false;
+/// main 窗口 + 辅助窗口几何快照（全局逻辑坐标）。
+///
+/// 为什么需要缓存：CGEventTap 回调跑在独立线程，而 Tauri/tao 的窗口查询
+/// （`get_webview_window` / `outer_position` / `is_visible`）必须在主线程。
+/// 之前直接在 tap 线程查窗口 API，进程会不定时静默崩溃（用户实测进程反复消失）。
+/// 现在命中测试只读这份缓存，由主线程命令刷新。
+#[derive(Default, Clone)]
+pub struct MainGeom {
+    pub visible: bool,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// (label, x, y, w, h)：本进程其他可见窗口，点击落在其中时不算桌宠命中
+    pub aux: Vec<(String, f64, f64, f64, f64)>,
+    /// 前端通过 set_main_force_cursor_ignore 表达的"希望全窗穿透"期望
+    pub front_force_ignore: bool,
+    /// 当前指针是否在桌宠交互区域内（由 tap 线程写）
+    pub pointer_in_pet: bool,
+}
+
+pub struct SharedMainGeom(pub std::sync::Mutex<MainGeom>);
+
+/// 主线程刷新几何缓存（窗口创建/移动/显隐、前端上报区域时调用）。
+/// 100ms 节流：前端每次点击都会上报 hit region，避免 IPC 线程被窗口查询拖慢。
+pub fn refresh_main_geom<R: tauri::Runtime>(app: &AppHandle<R>) {
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let now = now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && now - last < 100 {
+        return;
     }
-    let (Ok(pos), Ok(size)) = (main.outer_position(), main.outer_size()) else {
-        return false;
+    LAST.store(now, Ordering::Relaxed);
+    // 保留上次的交互态字段（几何刷新不应重置指针/前端期望状态）
+    let (front_force_ignore, pointer_in_pet) = app
+        .state::<SharedMainGeom>()
+        .0
+        .lock()
+        .map(|g| (g.front_force_ignore, g.pointer_in_pet))
+        .unwrap_or((true, false));
+    let mut g = MainGeom {
+        front_force_ignore,
+        pointer_in_pet,
+        ..Default::default()
     };
-    let (mpx, mpy) = (pos.x as f64, pos.y as f64);
-    let (mw, mh) = (size.width as f64, size.height as f64);
-    if gx < mpx || gx > mpx + mw || gy < mpy || gy > mpy + mh {
-        return false;
-    }
-    // 辅助窗口遮挡（它们不穿透，点击应归属它们自己）
+    let mut aux = Vec::new();
     for (label, win) in app.webview_windows() {
-        if label == "main" {
+        let visible = win.is_visible().unwrap_or(false);
+        let (Ok(p), Ok(s)) = (win.outer_position(), win.outer_size()) else {
             continue;
-        }
-        let Ok(true) = win.is_visible() else { continue };
-        let (Ok(p), Ok(s)) = (win.outer_position(), win.outer_size()) else { continue };
+        };
         let (x, y, w, h) = (p.x as f64, p.y as f64, s.width as f64, s.height as f64);
-        if gx >= x && gx <= x + w && gy >= y && gy <= y + h {
+        if label == "main" {
+            g.visible = visible;
+            g.x = x;
+            g.y = y;
+            g.w = w;
+            g.h = h;
+        } else if visible {
+            aux.push((label, x, y, w, h));
+        }
+    }
+    g.aux = aux;
+    if let Ok(mut slot) = app.state::<SharedMainGeom>().0.lock() {
+        *slot = g;
+    }
+}
+
+/// 主线程：按"指针是否在桌宠区域"切换 main 窗口的鼠标穿透。
+///
+/// 无「输入监控」权限时 Default tap 建不出来（无法吞事件），
+/// 此时用"悬停即接收"兜底：指针进桌宠区域 → 窗口接收鼠标（点击不落到桌面），
+/// 指针离开 → 恢复穿透（不挡桌面）。
+pub fn apply_pointer_hover<R: tauri::Runtime>(app: &AppHandle<R>, in_pet: bool) {
+    let geom_state = app.state::<SharedMainGeom>();
+    let actual_ignore = {
+        let Ok(mut g) = geom_state.0.lock() else {
+            return;
+        };
+        g.pointer_in_pet = in_pet;
+        // 指针在桌宠上时永不穿透；不在时才尊重前端的 force_ignore 期望
+        g.front_force_ignore && !in_pet
+    };
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_ignore_cursor_events(actual_ignore);
+    }
+}
+
+/// 桌宠命中测试（纯内存计算，不碰窗口 API，可在 tap 线程安全调用）。
+///
+/// 判定链与官方 Windows per-region hit test 等价：
+/// 1. main 可见且点在 main 的全局逻辑矩形内；
+/// 2. 点不在本进程其他可见窗口内（那些点击属于辅助窗口自己）；
+/// 3. 转为窗口内 CSS 逻辑坐标后命中 input_regions 或 visual_regions。
+pub fn hit_test(app: &AppHandle, gx: f64, gy: f64) -> bool {
+    let geom_state = app.state::<SharedMainGeom>();
+    let Ok(g) = geom_state.0.lock() else {
+        return false;
+    };
+    if !g.visible {
+        return false;
+    }
+    if gx < g.x || gx > g.x + g.w || gy < g.y || gy > g.y + g.h {
+        return false;
+    }
+    for (_label, x, y, w, h) in &g.aux {
+        if gx >= *x && gx <= *x + *w && gy >= *y && gy <= *y + *h {
             return false;
         }
     }
-    // 全局物理坐标 → main 窗口内 CSS 逻辑坐标
-    let scale = main.scale_factor().unwrap_or(1.0);
-    if scale <= 0.0 {
+    let (mx, my) = (g.x, g.y);
+    drop(g);
+    let lx = gx - mx;
+    let ly = gy - my;
+    let hit_state = app.state::<SharedMainHitState>();
+    let Ok(st) = hit_state.0.lock() else {
         return false;
-    }
-    let lx = (gx - mpx) / scale;
-    let ly = (gy - mpy) / scale;
-    let st = app
-        .state::<SharedMainHitState>()
-        .0
-        .lock()
-        .map(|s| (s.input_regions.clone(), s.visual_regions.clone()))
-        .unwrap_or_default();
-    let (inputs, visuals) = st;
-    inputs.iter().any(|r| r.contains(lx, ly)) || visuals.iter().any(|r| r.contains(lx, ly))
+    };
+    st.input_regions.iter().any(|r| r.contains(lx, ly))
+        || st.visual_regions.iter().any(|r| r.contains(lx, ly))
 }
 
 /// 鼠标按下/释放 → `mouse-button`（前端据此合成点击/拖拽/右键菜单）。
-/// 必须主线程调用（窗口几何查询）。
-pub fn handle_mouse_button(app: &AppHandle, gx: f64, gy: f64, right: bool, press: bool) {
-    if press && !route_mouse_press(app, gx, gy) {
-        return;
-    }
+/// 纯 emit，不查窗口几何，可从 tap 线程直接调用。
+/// 注意：tap 回调里严禁同步写盘（会触发 tap 超时被系统禁用）。
+pub fn handle_mouse_button(app: &AppHandle, _gx: f64, _gy: f64, right: bool, press: bool) {
     let _ = app.emit_to(
         "main",
         "mouse-button",
@@ -237,37 +311,47 @@ extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
 
+// 输入监控权限（kTCCServiceListenEvent）。
+// 区别（macOS 10.15+）：
+// - ListenOnly tap（只观测）→ 只需「辅助功能 / Accessibility」
+// - Default tap（可吞事件，防止点击穿透）→ 还需要「输入监控 / Input Monitoring」
+// 缺输入监控时 CGEventTapCreate(Default) 直接返回 null，只能退回 ListenOnly，
+// 桌宠区域的点击就会穿透到桌面。
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
+}
+
+fn listen_event_granted() -> bool {
+    unsafe { CGPreflightListenEventAccess() }
+}
+
 /// 回调与 worker 共享的上下文。回调在其 runloop 线程上串行执行，
 /// 仅原子计数需要跨线程。
 struct TapContext {
     app: AppHandle,
     last_move_ms: AtomicI64,
+    /// 本次按下是否命中了桌宠区域（命中则吞掉 press/drag/up，阻止事件穿透到桌面）
+    swallowing: std::sync::atomic::AtomicBool,
+    /// 指针当前是否悬停在桌宠区域（变化时切换窗口穿透状态）
+    pointer_in_pet: std::sync::atomic::AtomicBool,
     /// tap 因超时被系统禁用时置位，由 worker 循环重新启用
     needs_tap_restart: Arc<std::sync::atomic::AtomicBool>,
-    /// 前端就绪握手（notify_input_bridge_ready 置位）。
-    /// tap 若从进程启动即高频 emit，会在 WebView 完成初始化前轰炸 IPC，
-    /// 与前端 onMounted 初始化链（监听注册）产生竞态，导致
-    /// key-press/mouse-button 监听注册失败（计数与桌宠交互全部失效，
-    /// 且现象随编译产物时序漂移、时好时坏）。故 emit 必须等握手。
-    bridge_ready: Arc<std::sync::atomic::AtomicBool>,
-    /// tap 建立时刻：握手丢失时的兜底（10s 后放行，防永久死锁）
-    tap_started: std::time::Instant,
 }
 
-impl TapContext {
-    /// 事件是否可以转发给前端：已握手，或超过兜底时限
-    fn bridge_open(&self) -> bool {
-        self.bridge_ready.load(Ordering::Acquire)
-            || self.tap_started.elapsed() > Duration::from_secs(10)
-    }
-}
-
-/// 前端就绪握手（lib.rs 的 notify_input_bridge_ready 命令调用）
+/// 前端就绪握手（lib.rs 的 notify_input_bridge_ready 命令调用）。
+/// 历史教训：曾按"emit 等握手"做门控，但前端初始化链中的 await 可能
+/// 依赖首批输入事件（mouse-move 布局等），门控与链形成循环等待 →
+/// 初始化链永久中断（hit region/监听注册全部不执行）。
+/// 现在握手只做日志观测，事件始终直转，不做任何门控。
 pub fn mark_input_bridge_ready<R: tauri::Runtime>(app: &AppHandle<R>) {
     use tauri::Manager;
     if let Some(st) = app.try_state::<crate::InputBridgeReady>() {
-        st.0.store(true, Ordering::Release);
-        println!("[input] bridge handshake received, event forwarding enabled");
+        let first = !st.0.swap(true, Ordering::AcqRel);
+        if first {
+            println!("[input] bridge handshake received (observer only, no gating)");
+        }
     }
 }
 
@@ -278,10 +362,17 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn emit_key(ctx: &TapContext, key: &str, pressed: bool) {
-    if !ctx.bridge_open() {
-        return;
+/// 指针位置变化时切换窗口穿透状态（仅在跨越桌宠边界时 dispatch 到主线程）。
+fn update_pointer_mode(ctx: &TapContext, gx: f64, gy: f64) {
+    let in_pet = hit_test(&ctx.app, gx, gy);
+    if ctx.pointer_in_pet.swap(in_pet, Ordering::AcqRel) != in_pet {
+        let app = ctx.app.clone();
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || apply_pointer_hover(&app2, in_pet));
     }
+}
+
+fn emit_key(ctx: &TapContext, key: &str, pressed: bool) {
     let name = if pressed { "key-press" } else { "key-release" };
     let _ = ctx.app.emit_to("main", name, key);
 }
@@ -361,15 +452,7 @@ fn handle_flags_changed(ctx: &TapContext, code: u16, flags: u64) {
 
 /// 鼠标按下/释放 → `mouse-button`（前端据此合成点击/拖拽/右键菜单）
 fn emit_mouse_button(ctx: &TapContext, gx: f64, gy: f64, right: bool, press: bool) {
-    if !ctx.bridge_open() {
-        return;
-    }
-    let app = ctx.app.clone();
-    let closure_app = app.clone();
-    // 命中路由需查窗口几何（主线程）；press 事件被过滤时不 emit
-    let _ = app.run_on_main_thread(move || {
-        handle_mouse_button(&closure_app, gx, gy, right, press);
-    });
+    handle_mouse_button(&ctx.app, gx, gy, right, press);
 }
 
 unsafe extern "C-unwind" fn event_tap_callback(
@@ -384,40 +467,89 @@ unsafe extern "C-unwind" fn event_tap_callback(
     // SAFETY: CoreGraphics 保证回调期内 event 有效。
     let event_ref = unsafe { event.as_ref() };
 
+    // ===== DEBUG: 每 100 个事件打印一次类型（用原子计数节流）=====
+    static EVENT_COUNT: AtomicI64 = AtomicI64::new(0);
+    let n = EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n % 500 == 0 {
+        println!("[input] TAP CALLBACK fired #{n}, type={event_type:?}");
+    }
+
     match event_type {
         CGEventType::KeyDown | CGEventType::KeyUp => {
-            if let Some(key) = map_key_code(key_code(event_ref)) {
-                emit_key(ctx, key, event_type == CGEventType::KeyDown);
+            let code = key_code(event_ref);
+            match map_key_code(code) {
+                Some(key) => {
+                    emit_key(ctx, key, event_type == CGEventType::KeyDown);
+                }
+                None => {
+                    // 未映射键低频记录（便于补齐映射表；写盘节流避免 tap 超时）
+                    static UNMAPPED: AtomicI64 = AtomicI64::new(0);
+                    let n = UNMAPPED.fetch_add(1, Ordering::Relaxed);
+                    if n < 20 {
+                        crate::dlog(&format!("[key] UNMAPPED code=0x{code:02X}"));
+                    }
+                }
             }
         }
         CGEventType::FlagsChanged => {
             let flags = CGEvent::flags(Some(event_ref)).bits();
             handle_flags_changed(ctx, key_code(event_ref), flags);
         }
-        CGEventType::MouseMoved
-        | CGEventType::LeftMouseDragged
-        | CGEventType::RightMouseDragged
-        | CGEventType::OtherMouseDragged => {
-            if !ctx.bridge_open() {
-                return event.as_ptr();
-            }
+        CGEventType::MouseMoved => {
+            // 普通移动：先按位置切换穿透状态（跨越桌宠边界时才 dispatch），
+            // 再按节流上报坐标给前端（前端据此更新 hover / 拖拽跟随）
+            let loc = CGEvent::location(Some(event_ref));
+            update_pointer_mode(ctx, loc.x, loc.y);
             let now = now_ms();
             if now - ctx.last_move_ms.load(Ordering::Relaxed) >= MOVE_THROTTLE_MS {
                 ctx.last_move_ms.store(now, Ordering::Relaxed);
-                let loc = CGEvent::location(Some(event_ref));
                 let (x, y) = to_physical(loc.x, loc.y);
-                let _ = ctx.app.emit_to("main", "mouse-move", serde_json::json!({ "x": x, "y": y }));
+                let _ = ctx
+                    .app
+                    .emit_to("main", "mouse-move", serde_json::json!({ "x": x, "y": y }));
+            }
+        }
+        CGEventType::LeftMouseDragged
+        | CGEventType::RightMouseDragged
+        | CGEventType::OtherMouseDragged => {
+            let loc = CGEvent::location(Some(event_ref));
+            update_pointer_mode(ctx, loc.x, loc.y);
+            let now = now_ms();
+            if now - ctx.last_move_ms.load(Ordering::Relaxed) >= MOVE_THROTTLE_MS {
+                ctx.last_move_ms.store(now, Ordering::Relaxed);
+                let (x, y) = to_physical(loc.x, loc.y);
+                let _ = ctx
+                    .app
+                    .emit_to("main", "mouse-move", serde_json::json!({ "x": x, "y": y }));
+            }
+            // 拖拽中：若本次按下命中了桌宠，吞掉 drag 事件，
+            // 否则 macOS 会拿它去拖选桌面图标/窗口
+            if ctx.swallowing.load(Ordering::Acquire) {
+                return std::ptr::null_mut();
             }
         }
         CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
             let loc = CGEvent::location(Some(event_ref));
-            let (x, y) = to_physical(loc.x, loc.y);
-            emit_mouse_button(ctx, x, y, event_type == CGEventType::RightMouseDown, true);
+            let right = event_type == CGEventType::RightMouseDown;
+            // 命中测试用缓存几何（tap 线程禁止调窗口 API 与写盘）
+            let hit = hit_test(&ctx.app, loc.x, loc.y);
+            update_pointer_mode(ctx, loc.x, loc.y);
+            // 无论是否命中都上报：前端内部用 elementFromPoint 再判定一次，
+            // 未命中时它也会用 release 收尾（关闭 dock/菜单）
+            emit_mouse_button(ctx, loc.x, loc.y, right, true);
+            if hit {
+                ctx.swallowing.store(true, Ordering::Release);
+                // 吞掉：事件不再传给桌面，解决"点击桌宠穿透到桌面"
+                return std::ptr::null_mut();
+            }
         }
         CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {
             let loc = CGEvent::location(Some(event_ref));
-            let (x, y) = to_physical(loc.x, loc.y);
-            emit_mouse_button(ctx, x, y, event_type == CGEventType::RightMouseUp, false);
+            let right = event_type == CGEventType::RightMouseUp;
+            emit_mouse_button(ctx, loc.x, loc.y, right, false);
+            if ctx.swallowing.swap(false, Ordering::AcqRel) {
+                return std::ptr::null_mut();
+            }
         }
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
             println!("[input] event tap disabled ({event_type:?}), will restart");
@@ -425,7 +557,6 @@ unsafe extern "C-unwind" fn event_tap_callback(
         }
         _ => {}
     }
-    // ListenOnly tap：事件原样透传
     event.as_ptr()
 }
 
@@ -457,104 +588,190 @@ pub fn start(app: AppHandle) {
 }
 
 fn run_worker(app: AppHandle) {
-    // 1) 等待辅助功能权限。
-    // adhoc 签名（signingIdentity "-"）的 app 每次重新编译签名都会变化，
-    // macOS 会视为新应用导致授权失效——此处必须给用户可见提示：
-    // 打开系统设置的辅助功能面板，并在日志/stdout 双通道记录。
-    let mut prompted = false;
-    loop {
-        // SAFETY: 纯查询的系统调用
-        if unsafe { AXIsProcessTrusted() } {
-            break;
-        }
-        if !prompted {
-            prompted = true;
-            println!(
-                "[input] 辅助功能未授权：已打开系统设置，请在 隐私与安全性 → 辅助功能 中勾选 WuwaTappo（授权后自动生效）"
-            );
-            let _ = std::fs::write(
-                "/tmp/wuwatappo-input.log",
-                "[input] accessibility NOT granted; waiting for user approval\n",
-            );
-            let _ = std::process::Command::new("open")
-                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-                .spawn();
-        }
-        thread::sleep(PERMISSION_POLL);
-    }
-    println!("[input] accessibility granted, creating CGEventTap");
+    // ===== 核心改动：不再先卡 AXIsProcessTrusted 检查！=====
+    // AXIsProcessTrusted() 是**静默**查询，永远不会触发系统弹权限对话框。
+    // macOS 只有在**真正调用 CGEventTapCreate** 时才会弹 "是否允许 WuwaTappo
+    // 控制你的电脑" 的授权对话框。所以必须先尝试 CGEventTapCreate——
+    // 即使第一次会返回 null（未授权），它也会触发弹窗。
+    // 用户点允许后，tap 还在当前调用里不会自动成功（需要重新调用），
+    // 所以这里用一个重试循环包着。
 
-    // 2) 建立 tap；context 由 Box 固定地址，worker 循环不退出故不会被释放
+    #[allow(unused_assignments)]
+    let mut tap_created_this_session = false;
+    let max_attempts = 60; // 3 分钟，给足用户点允许的时间
+
     let needs_restart = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let bridge_ready = {
-        use tauri::Manager;
-        app.try_state::<crate::InputBridgeReady>()
-            .map(|s| Arc::clone(&s.0))
-            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
-    };
     let ctx = Box::new(TapContext {
         app,
         last_move_ms: AtomicI64::new(0),
+        swallowing: std::sync::atomic::AtomicBool::new(false),
+        pointer_in_pet: std::sync::atomic::AtomicBool::new(false),
         needs_tap_restart: Arc::clone(&needs_restart),
-        bridge_ready,
-        tap_started: std::time::Instant::now(),
     });
     let ctx_ptr: *mut c_void = (&*ctx as *const TapContext).cast_mut().cast();
 
-    // SAFETY: ctx 指向本线程持有的稳定 Box 分配；tap 为 ListenOnly。
-    let tap = unsafe {
-        CGEvent::tap_create(
-            CGEventTapLocation::HIDEventTap,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::ListenOnly,
-            event_mask(),
-            Some(event_tap_callback),
-            ctx_ptr,
-        )
-    };
-    let tap = match tap {
-        Some(t) => t,
-        None => {
-            println!("[input] CGEventTapCreate failed（权限可能被撤销），全局键鼠监听停用");
-            return;
-        }
-    };
-    let source = match CFMachPort::new_run_loop_source(None, Some(&tap), 0) {
-        Some(s) => s,
-        None => {
-            println!("[input] create runloop source failed");
-            return;
-        }
-    };
-    let run_loop = match CFRunLoop::current() {
-        Some(rl) => rl,
-        None => {
-            println!("[input] no current runloop");
-            return;
-        }
-    };
-    // SAFETY: 进程级不可变常量
-    let mode = match unsafe { kCFRunLoopDefaultMode } {
-        Some(m) => m,
-        None => {
-            println!("[input] kCFRunLoopDefaultMode unavailable");
-            return;
-        }
-    };
-    run_loop.add_source(Some(&source), Some(mode));
-    CGEvent::tap_enable(&tap, true);
-    if !CGEvent::tap_is_enabled(&tap) {
-        println!("[input] tap enable failed");
-        return;
+    // ===== 输入监控权限：Default tap（可吞事件）的前置条件 =====
+    // 之前只查辅助功能，导致 Default tap 被系统拒绝、退回 ListenOnly，
+    // 表现就是"点击桌宠穿透到桌面"。这里主动请求一次，让系统弹授权框。
+    if !listen_event_granted() {
+        println!(
+            "[input] 输入监控(Input Monitoring)未授权 → 点击桌宠会穿透；正在请求系统授权"
+        );
+        let _ = std::fs::write(
+            "/tmp/wuwatappo-input.log",
+            "[input] Input Monitoring NOT granted\n\
+             → 已请求系统授权；若未弹窗请手动：系统设置 → 隐私与安全性 → 输入监控 → 勾选 WuwaTappo\n\
+             → 未授权时：点击/拖拽桌宠的事件会穿透到桌面\n",
+        );
+        let _ = std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+            .spawn();
+        // 弹系统授权对话框（每个 app 生命周期内仅首次有效）
+        let _ = unsafe { CGRequestListenEventAccess() };
     }
-    println!("[input] CGEventTap running (HID head, listen-only)");
-
-    // 3) 分片运行：响应 tap 超时重启
-    loop {
-        CFRunLoop::run_in_mode(Some(mode), RUN_LOOP_SLICE, true);
-        if needs_restart.swap(false, Ordering::AcqRel) {
-            println!("[input] re-enabling event tap after timeout");
-            CGEvent::tap_enable(&tap, true);
+    for attempt in 1..=max_attempts {
+        // 有输入监控权限时才可能创建 Default（可吞事件）tap；
+        // 否则先试 ListenOnly（只观测，点击会穿透），避免每轮空等。
+        let can_swallow = listen_event_granted();
+        let mut active_tap = can_swallow;
+        let mut tap = if can_swallow {
+            unsafe {
+                CGEvent::tap_create(
+                    CGEventTapLocation::HIDEventTap,
+                    CGEventTapPlacement::HeadInsertEventTap,
+                    CGEventTapOptions::Default,
+                    event_mask(),
+                    Some(event_tap_callback),
+                    ctx_ptr,
+                )
+            }
+        } else {
+            None
+        };
+        if tap.is_none() {
+            active_tap = false;
+            tap = unsafe {
+                CGEvent::tap_create(
+                    CGEventTapLocation::HIDEventTap,
+                    CGEventTapPlacement::HeadInsertEventTap,
+                    CGEventTapOptions::ListenOnly,
+                    event_mask(),
+                    Some(event_tap_callback),
+                    ctx_ptr,
+                )
+            };
+            if tap.is_some() && can_swallow {
+                println!("[input] Default tap 被拒，退回 ListenOnly（点击会穿透）");
+            }
         }
+        if let Some(t) = tap {
+            // ===== 成功了！=====
+            tap_created_this_session = true;
+            let tap = t;
+            let _ = std::fs::write(
+                "/tmp/wuwatappo-input.log",
+                format!(
+                    "[input] tap mode = {}\n",
+                    if active_tap {
+                        "default/swallow（输入监控已授权 → 桌宠区域点击不穿透）"
+                    } else {
+                        "listen-only（缺「输入监控」权限 → 点击会穿透到桌面）"
+                    }
+                ),
+            );
+            println!("[input] ✓ CGEventTap created on attempt #{attempt}");
+
+            let source = match CFMachPort::new_run_loop_source(None, Some(&tap), 0) {
+                Some(s) => s,
+                None => {
+                    println!("[input] create runloop source failed");
+                    return;
+                }
+            };
+            let run_loop = match CFRunLoop::current() {
+                Some(rl) => rl,
+                None => {
+                    println!("[input] no current runloop");
+                    return;
+                }
+            };
+            let mode = match unsafe { kCFRunLoopDefaultMode } {
+                Some(m) => m,
+                None => {
+                    println!("[input] kCFRunLoopDefaultMode unavailable");
+                    return;
+                }
+            };
+            run_loop.add_source(Some(&source), Some(mode));
+            CGEvent::tap_enable(&tap, true);
+            if !CGEvent::tap_is_enabled(&tap) {
+                println!("[input] tap enable failed");
+                return;
+            }
+            println!(
+                "[input] CGEventTap running (HID head, {})",
+                if active_tap { "default/swallow" } else { "listen-only" }
+            );
+
+            // ===== 分片运行：响应 tap 超时重启 + 输入监控授权后自动升级 =====
+            let mut last_perm_check = now_ms();
+            loop {
+                CFRunLoop::run_in_mode(Some(mode), RUN_LOOP_SLICE, true);
+                if needs_restart.swap(false, Ordering::AcqRel) {
+                    println!("[input] re-enabling event tap after timeout");
+                    CGEvent::tap_enable(&tap, true);
+                }
+                // ListenOnly 运行期间持续检查输入监控：一旦用户授权，
+                // 立刻跳出重建为 Default tap（可吞事件），无需重启应用
+                if !active_tap && now_ms() - last_perm_check >= 2000 {
+                    last_perm_check = now_ms();
+                    if listen_event_granted() {
+                        println!("[input] 输入监控已授权 → 重建 Default tap（防穿透生效）");
+                        let _ = std::fs::write(
+                            "/tmp/wuwatappo-input.log",
+                            "[input] Input Monitoring granted — rebuilding Default tap\n",
+                        );
+                        break;
+                    }
+                }
+            }
+            println!("[input] recreating event tap (upgrade to Default)");
+            continue;
+        } else {
+            // ===== CGEventTapCreate 失败：要么权限未授予，要么 macOS 需要弹窗 =====
+            if attempt == 1 {
+                // 第一次失败：打开系统设置 + 写日志，让用户知道需要授权
+                let _ = std::fs::write(
+                    "/tmp/wuwatappo-input.log",
+                    "[input] CGEventTapCreate failed (accessibility not granted?)\n\
+                     → 系统应该弹出 '是否允许 WuwaTappo 控制你的电脑' 的对话框\n\
+                     → 点'允许'，或在 系统设置 → 隐私与安全性 → 无障碍 中手动勾选\n",
+                );
+                let _ = std::process::Command::new("open")
+                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                    .spawn();
+                println!(
+                    "[input] CGEventTapCreate attempt #1 failed → 已打开系统设置等待授权（最多 {} 次重试）",
+                    max_attempts
+                );
+                let mut _unused = unsafe { AXIsProcessTrusted() }; // 保留符号链接
+            }
+            // 等 3 秒再试
+            thread::sleep(std::time::Duration::from_secs(3));
+            if attempt % 10 == 0 {
+                println!("[input] still waiting for accessibility... ({attempt}/{max_attempts})");
+            }
+        }
+    }
+
+    // 3 分钟内都没成功
+    if !tap_created_this_session {
+        let _ = std::fs::write(
+            "/tmp/wuwatappo-input.log",
+            "[input] CGEventTapCreate failed after all retries\n\
+             → 请手动检查：系统设置 → 隐私与安全性 → 无障碍 → 勾选 WuwaTappo\n\
+             → 或检查终端有没有弹出授权对话框没点\n",
+        );
+        println!("[input] FATAL: CGEventTapCreate failed after {max_attempts} attempts. Check Accessibility permission.");
     }
 }
