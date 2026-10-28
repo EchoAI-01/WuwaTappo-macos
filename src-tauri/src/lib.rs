@@ -807,7 +807,17 @@ fn open_login_window<R: Runtime>(
     // 前端 login 卡片固定 500x378（login-CBA3ItgU.css），窗口必须容得下，
     // 之前给 400x620 会把卡片右边裁掉 100px
     create_aux_window(&app, "login", "/login", "WuwaTappo", 520.0, 440.0, false)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // 诊断：窗口若可见但内容全透明，用户会看不到任何东西。
+    // 这里注入一个高对比底色，用于区分"窗口不在"还是"内容没渲染"。
+    if let Some(win) = app.get_webview_window("login") {
+        let _ = win.eval(
+            "document.documentElement.style.setProperty('background','#ff0000','important');\
+             document.body.style.setProperty('background','#ff0000','important');",
+        );
+        dlog("[login] diag: injected red background");
+    }
+    Ok(())
 }
 
 #[tauri::command]
