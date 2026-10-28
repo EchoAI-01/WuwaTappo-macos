@@ -21,7 +21,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -190,7 +190,8 @@ pub fn apply_pointer_hover<R: tauri::Runtime>(app: &AppHandle<R>, in_pet: bool) 
 /// 3. 转为窗口内 CSS 逻辑坐标后命中 input_regions 或 visual_regions。
 pub fn hit_test(app: &AppHandle, gx: f64, gy: f64) -> bool {
     let geom_state = app.state::<SharedMainGeom>();
-    let Ok(g) = geom_state.0.lock() else {
+    // try_lock：回调线程绝不能阻塞在此（主线程可能正在 refresh_main_geom）
+    let Ok(g) = geom_state.0.try_lock() else {
         return false;
     };
     if !g.visible {
@@ -209,7 +210,7 @@ pub fn hit_test(app: &AppHandle, gx: f64, gy: f64) -> bool {
     let lx = gx - mx;
     let ly = gy - my;
     let hit_state = app.state::<SharedMainHitState>();
-    let Ok(st) = hit_state.0.lock() else {
+    let Ok(st) = hit_state.0.try_lock() else {
         return false;
     };
     st.input_regions.iter().any(|r| r.contains(lx, ly))
@@ -217,9 +218,8 @@ pub fn hit_test(app: &AppHandle, gx: f64, gy: f64) -> bool {
 }
 
 /// 鼠标按下/释放 → `mouse-button`（前端据此合成点击/拖拽/右键菜单）。
-/// 纯 emit，不查窗口几何，可从 tap 线程直接调用。
-/// 注意：tap 回调里严禁同步写盘（会触发 tap 超时被系统禁用）。
-pub fn handle_mouse_button(app: &AppHandle, _gx: f64, _gy: f64, right: bool, press: bool) {
+/// 只入队，不做任何阻塞操作。
+pub fn handle_mouse_button_now(app: &AppHandle, right: bool, press: bool) {
     let _ = app.emit_to(
         "main",
         "mouse-button",
@@ -327,8 +327,21 @@ fn listen_event_granted() -> bool {
     unsafe { CGPreflightListenEventAccess() }
 }
 
+/// tap 回调 → 独立发送线程的消息。
+///
+/// 为什么必须异步：CGEventTap 回调若耗时超过系统阈值（约 0.25s），
+/// 该事件会被系统直接丢弃。KeyUp 一旦被丢，系统会认为按键一直按着，
+/// 触发键盘重复——表现为按 Cmd+Q 退出时字符疯狂刷屏（用户实测必现）。
+/// 之前回调里直接 emit_to / dlog 写盘 / 查 state 都可能阻塞，必须全部移出。
+enum TapMsg {
+    Key(&'static str, bool),
+    Move(f64, f64),
+    Button(bool, bool),
+    Hover(bool),
+}
+
 /// 回调与 worker 共享的上下文。回调在其 runloop 线程上串行执行，
-/// 仅原子计数需要跨线程。
+/// 只做内存判断 + try_send，绝不阻塞。
 struct TapContext {
     app: AppHandle,
     last_move_ms: AtomicI64,
@@ -336,8 +349,53 @@ struct TapContext {
     swallowing: std::sync::atomic::AtomicBool,
     /// 指针当前是否悬停在桌宠区域（变化时切换窗口穿透状态）
     pointer_in_pet: std::sync::atomic::AtomicBool,
+    /// 当前 tap 是否为 Default（可吞事件）。Default 时不做窗口穿透切换，
+    /// 否则 WKWebView 的原生 DOM 事件会和合成事件打架（用户实测点击失效）。
+    active_default: std::sync::atomic::AtomicBool,
+    /// 事件发送通道（有界；满了就丢，绝不阻塞回调）
+    tx: std::sync::mpsc::SyncSender<TapMsg>,
+    /// 仍处于按下状态的键位图（keycode < 64 的常见键）。
+    /// tap 被系统禁用重启后用它补发 key-release——前端用 `Pr` Set 去重，
+    /// 一旦 keyup 丢失，该键会永久卡在 Set 里，表现为"计数器用一会儿就彻底不计数"。
+    pressed_keys: std::sync::atomic::AtomicU64,
     /// tap 因超时被系统禁用时置位，由 worker 循环重新启用
     needs_tap_restart: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 独立事件发送线程：把 tap 回调里攒下的消息串行 emit 给前端。
+fn spawn_emitter(app: AppHandle, rx: std::sync::mpsc::Receiver<TapMsg>) {
+    thread::Builder::new()
+        .name("input-emitter".into())
+        .spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    TapMsg::Key(key, pressed) => {
+                        let name = if pressed { "key-press" } else { "key-release" };
+                        let _ = app.emit_to("main", name, key);
+                    }
+                    TapMsg::Move(x, y) => {
+                        let _ = app
+                            .emit_to("main", "mouse-move", serde_json::json!({ "x": x, "y": y }));
+                    }
+                    TapMsg::Button(right, press) => {
+                        let _ = app.emit_to(
+                            "main",
+                            "mouse-button",
+                            serde_json::json!({
+                                "button": if right { "right" } else { "left" },
+                                "action": if press { "press" } else { "release" },
+                            }),
+                        );
+                    }
+                    TapMsg::Hover(in_pet) => {
+                        let a = app.clone();
+                        let a2 = a.clone();
+                        let _ = a.run_on_main_thread(move || apply_pointer_hover(&a2, in_pet));
+                    }
+                }
+            }
+        })
+        .expect("spawn input-emitter thread");
 }
 
 /// 前端就绪握手（lib.rs 的 notify_input_bridge_ready 命令调用）。
@@ -362,19 +420,21 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 指针位置变化时切换窗口穿透状态（仅在跨越桌宠边界时 dispatch 到主线程）。
+/// 指针位置变化时切换窗口穿透状态（仅在跨越桌宠边界时入队）。
+/// Default tap 模式下窗口恒穿透、由吞事件处理点击，不做切换。
 fn update_pointer_mode(ctx: &TapContext, gx: f64, gy: f64) {
+    if ctx.active_default.load(Ordering::Relaxed) {
+        return;
+    }
     let in_pet = hit_test(&ctx.app, gx, gy);
     if ctx.pointer_in_pet.swap(in_pet, Ordering::AcqRel) != in_pet {
-        let app = ctx.app.clone();
-        let app2 = app.clone();
-        let _ = app.run_on_main_thread(move || apply_pointer_hover(&app2, in_pet));
+        let _ = ctx.tx.try_send(TapMsg::Hover(in_pet));
     }
 }
 
-fn emit_key(ctx: &TapContext, key: &str, pressed: bool) {
-    let name = if pressed { "key-press" } else { "key-release" };
-    let _ = ctx.app.emit_to("main", name, key);
+/// 按键 → 入队（回调里绝不直接 emit）
+fn emit_key(ctx: &TapContext, key: &'static str, pressed: bool) {
+    let _ = ctx.tx.try_send(TapMsg::Key(key, pressed));
 }
 
 fn key_code(event: &CGEvent) -> u16 {
@@ -450,9 +510,9 @@ fn handle_flags_changed(ctx: &TapContext, code: u16, flags: u64) {
     emit_key(ctx, key, flags & mask != 0);
 }
 
-/// 鼠标按下/释放 → `mouse-button`（前端据此合成点击/拖拽/右键菜单）
-fn emit_mouse_button(ctx: &TapContext, gx: f64, gy: f64, right: bool, press: bool) {
-    handle_mouse_button(&ctx.app, gx, gy, right, press);
+/// 鼠标按下/释放 → 入队（回调里绝不直接 emit）
+fn emit_mouse_button(ctx: &TapContext, right: bool, press: bool) {
+    let _ = ctx.tx.try_send(TapMsg::Button(right, press));
 }
 
 unsafe extern "C-unwind" fn event_tap_callback(
@@ -477,17 +537,24 @@ unsafe extern "C-unwind" fn event_tap_callback(
     match event_type {
         CGEventType::KeyDown | CGEventType::KeyUp => {
             let code = key_code(event_ref);
+            let pressed = event_type == CGEventType::KeyDown;
+            // 维护按下键位图（供 tap 重启后补发 release）
+            if code < 64 {
+                let bit = 1u64 << code;
+                if pressed {
+                    ctx.pressed_keys.fetch_or(bit, Ordering::Relaxed);
+                } else {
+                    ctx.pressed_keys.fetch_and(!bit, Ordering::Relaxed);
+                }
+            }
             match map_key_code(code) {
                 Some(key) => {
-                    emit_key(ctx, key, event_type == CGEventType::KeyDown);
+                    emit_key(ctx, key, pressed);
                 }
                 None => {
-                    // 未映射键低频记录（便于补齐映射表；写盘节流避免 tap 超时）
+                    // 未映射键只累加计数，不写盘（写盘会拖慢回调导致事件丢失）
                     static UNMAPPED: AtomicI64 = AtomicI64::new(0);
-                    let n = UNMAPPED.fetch_add(1, Ordering::Relaxed);
-                    if n < 20 {
-                        crate::dlog(&format!("[key] UNMAPPED code=0x{code:02X}"));
-                    }
+                    UNMAPPED.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -496,7 +563,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
             handle_flags_changed(ctx, key_code(event_ref), flags);
         }
         CGEventType::MouseMoved => {
-            // 普通移动：先按位置切换穿透状态（跨越桌宠边界时才 dispatch），
+            // 普通移动：先按位置切换穿透状态（跨越桌宠边界时才入队），
             // 再按节流上报坐标给前端（前端据此更新 hover / 拖拽跟随）
             let loc = CGEvent::location(Some(event_ref));
             update_pointer_mode(ctx, loc.x, loc.y);
@@ -504,9 +571,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
             if now - ctx.last_move_ms.load(Ordering::Relaxed) >= MOVE_THROTTLE_MS {
                 ctx.last_move_ms.store(now, Ordering::Relaxed);
                 let (x, y) = to_physical(loc.x, loc.y);
-                let _ = ctx
-                    .app
-                    .emit_to("main", "mouse-move", serde_json::json!({ "x": x, "y": y }));
+                let _ = ctx.tx.try_send(TapMsg::Move(x, y));
             }
         }
         CGEventType::LeftMouseDragged
@@ -518,9 +583,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
             if now - ctx.last_move_ms.load(Ordering::Relaxed) >= MOVE_THROTTLE_MS {
                 ctx.last_move_ms.store(now, Ordering::Relaxed);
                 let (x, y) = to_physical(loc.x, loc.y);
-                let _ = ctx
-                    .app
-                    .emit_to("main", "mouse-move", serde_json::json!({ "x": x, "y": y }));
+                let _ = ctx.tx.try_send(TapMsg::Move(x, y));
             }
             // 拖拽中：若本次按下命中了桌宠，吞掉 drag 事件，
             // 否则 macOS 会拿它去拖选桌面图标/窗口
@@ -536,7 +599,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
             update_pointer_mode(ctx, loc.x, loc.y);
             // 无论是否命中都上报：前端内部用 elementFromPoint 再判定一次，
             // 未命中时它也会用 release 收尾（关闭 dock/菜单）
-            emit_mouse_button(ctx, loc.x, loc.y, right, true);
+            emit_mouse_button(ctx, right, true);
             if hit {
                 ctx.swallowing.store(true, Ordering::Release);
                 // 吞掉：事件不再传给桌面，解决"点击桌宠穿透到桌面"
@@ -546,7 +609,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
         CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {
             let loc = CGEvent::location(Some(event_ref));
             let right = event_type == CGEventType::RightMouseUp;
-            emit_mouse_button(ctx, loc.x, loc.y, right, false);
+            emit_mouse_button(ctx, right, false);
             if ctx.swallowing.swap(false, Ordering::AcqRel) {
                 return std::ptr::null_mut();
             }
@@ -601,11 +664,17 @@ fn run_worker(app: AppHandle) {
     let max_attempts = 60; // 3 分钟，给足用户点允许的时间
 
     let needs_restart = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 事件发送通道：容量 1024，try_send 满则丢帧（绝不阻塞 tap 回调）
+    let (tx, rx) = std::sync::mpsc::sync_channel::<TapMsg>(1024);
+    spawn_emitter(app.clone(), rx);
     let ctx = Box::new(TapContext {
         app,
         last_move_ms: AtomicI64::new(0),
         swallowing: std::sync::atomic::AtomicBool::new(false),
         pointer_in_pet: std::sync::atomic::AtomicBool::new(false),
+        active_default: std::sync::atomic::AtomicBool::new(false),
+        tx,
+        pressed_keys: AtomicU64::new(0),
         needs_tap_restart: Arc::clone(&needs_restart),
     });
     let ctx_ptr: *mut c_void = (&*ctx as *const TapContext).cast_mut().cast();
@@ -667,6 +736,7 @@ fn run_worker(app: AppHandle) {
         if let Some(t) = tap {
             // ===== 成功了！=====
             tap_created_this_session = true;
+            ctx.active_default.store(active_tap, Ordering::Release);
             let tap = t;
             let _ = std::fs::write(
                 "/tmp/wuwatappo-input.log",
@@ -719,6 +789,22 @@ fn run_worker(app: AppHandle) {
                 CFRunLoop::run_in_mode(Some(mode), RUN_LOOP_SLICE, true);
                 if needs_restart.swap(false, Ordering::AcqRel) {
                     println!("[input] re-enabling event tap after timeout");
+                    // 补发仍"按下"的键的 release：
+                    // tap 禁用期间丢失的 keyup 会让前端 Pr 集合永久残留，
+                    // 表现为计数彻底失效。这里统一补一次 release 清干净。
+                    let bits = ctx.pressed_keys.swap(0, Ordering::AcqRel);
+                    let mut released = 0;
+                    for code in 0..64u16 {
+                        if bits & (1u64 << code) != 0 {
+                            if let Some(k) = map_key_code(code) {
+                                let _ = ctx.tx.try_send(TapMsg::Key(k, false));
+                                released += 1;
+                            }
+                        }
+                    }
+                    if released > 0 {
+                        println!("[input] released {released} stale keys after tap restart");
+                    }
                     CGEvent::tap_enable(&tap, true);
                 }
                 // ListenOnly 运行期间持续检查输入监控：一旦用户授权，
@@ -736,6 +822,7 @@ fn run_worker(app: AppHandle) {
                 }
             }
             println!("[input] recreating event tap (upgrade to Default)");
+            ctx.active_default.store(false, Ordering::Release);
             continue;
         } else {
             // ===== CGEventTapCreate 失败：要么权限未授予，要么 macOS 需要弹窗 =====
