@@ -704,8 +704,25 @@ fn create_aux_window_min<R: Runtime>(
         let _ = win.set_focus();
         let _ = win.set_always_on_top(true);
     }
+    // main 必须先降层，否则全屏 floating 的 main 会盖住刚创建的辅助窗口
+    sync_main_layer(app);
     input::refresh_main_geom(app);
     Ok(())
+}
+
+/// 辅助窗口存在时把 main 从 alwaysOnTop 降下来。
+///
+/// main 是全屏 floating 层窗口，和 login/panel 同层；同层窗口谁最后 orderFront
+/// 谁在上面，main 只要被激活就会盖住辅助窗口（实测 login visible=true 但看不见）。
+/// 辅助窗口全部关闭后再恢复置顶，保证桌宠仍然常在最前。
+fn sync_main_layer<R: Runtime>(app: &AppHandle<R>) {
+    let has_aux = app
+        .webview_windows()
+        .iter()
+        .any(|(label, w)| label != "main" && w.is_visible().unwrap_or(false));
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.set_always_on_top(!has_aux);
+    }
 }
 
 /// 打开/聚焦 panel 窗口（前端 dock-open-panel 链路的 Rust 落点）。
@@ -750,6 +767,7 @@ fn close_panel_window<R: Runtime>(app: AppHandle<R>) {
     if let Some(win) = app.get_webview_window("panel") {
         let _ = win.close();
     }
+    sync_main_layer(&app);
 }
 
 /// panel 浮到桌宠之上（宠物会遮挡面板时的层级修正）
@@ -798,6 +816,7 @@ fn close_login_window<R: Runtime>(app: AppHandle<R>) {
     if let Some(win) = app.get_webview_window("login") {
         let _ = win.close();
     }
+    sync_main_layer(&app);
 }
 
 #[tauri::command]
@@ -836,6 +855,7 @@ fn close_update_window<R: Runtime>(app: AppHandle<R>) {
     if let Some(win) = app.get_webview_window("update") {
         let _ = win.close();
     }
+    sync_main_layer(&app);
 }
 
 #[tauri::command]
@@ -851,6 +871,7 @@ fn close_about_window<R: Runtime>(app: AppHandle<R>) {
     if let Some(win) = app.get_webview_window("about") {
         let _ = win.close();
     }
+    sync_main_layer(&app);
 }
 
 #[tauri::command]
@@ -866,6 +887,7 @@ fn close_oss_notice_window<R: Runtime>(app: AppHandle<R>) {
     if let Some(win) = app.get_webview_window("oss-notice") {
         let _ = win.close();
     }
+    sync_main_layer(&app);
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,18 +1235,6 @@ pub fn run() {
             // 全局键鼠监听（key-press/key-release/mouse-move 事件源；
             // 辅助功能授权后自动生效，未授权时仅日志提示不影响启动）
             input::start(app.handle().clone());
-
-            // TEMP-DEBUG：WUWA_OPEN_LOGIN=1 时自动打开 login 窗口，便于验证可见性
-            if std::env::var("WUWA_OPEN_LOGIN").is_ok() {
-                let h = app.handle().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(4));
-                    let _ = create_aux_window(
-                        &h, "login", "/login", "WuwaTappo", 400.0, 620.0, false,
-                    );
-                    println!("[debug] auto-open login window");
-                });
-            }
 
             // keep-alive + 窗口/状态诊断。
             // keep-alive（关键修复）：WKWebView 会对"无活动"的页面执行 idle 挂起
