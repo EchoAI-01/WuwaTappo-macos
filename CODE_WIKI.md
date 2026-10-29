@@ -3,7 +3,8 @@
 > 鸣潮桌宠 macOS 移植版 — 社区逆向重建壳  
 > 仓库版本：v0.0.1-Beta | Tauri 2.10.3 | Rust Edition 2021  
 > 官方前端资产版本：1.0.1（`Cargo.toml`/`tauri.conf.json` 中的版本号沿袭官方 exe 资产，便于对应官方功能集）  
-> 仓库：https://github.com/EchoAI-01/WuwaTappo-macos
+> 仓库：https://github.com/EchoAI-01/WuwaTappo-macos  
+> 文档更新：2026-10-29（同步 input.rs 双模式 tap / 通道化回调 / 几何缓存 / 固定签名等改动）
 
 ---
 
@@ -144,14 +145,16 @@
 ┌─────────────────────────────────────────────────────────────────────┐
 │                   Rust 原生输入桥 (input.rs)                        │
 │  ┌─────────────────┐  ┌──────────────────┐  ┌───────────────────┐  │
-│  │ CGEventTap      │  │ 命中区域过滤      │  │ 事件直转无门控     │  │
-│  │ (HIDEventTap +  │──▶│ (per-region)     │──▶│ （握手仅日志观测） │  │
-│  │  HeadInsert,    │  │                   │  │                   │  │
-│  │  ListenOnly)    │  │ 鼠标按下过滤：     │  │ 避免初始化循环等   │  │
-│  │                 │  │ - main 窗口内     │  │ 待（踩坑 §3）      │  │
-│  │                 │  │ - 不在辅助窗口上  │  │                   │  │
-│  │                 │  │ - 命中桌宠区域    │  │                   │  │
-│  └─────────────────┘  └──────────────────┘  └───────────────────┘  │
+│  │ CGEventTap      │  │ 命中测试          │  │ 事件直转无门控     │  │
+│  │ HIDEventTap +   │──▶│ hit_test()       │──▶│ （握手仅日志观测） │  │
+│  │ HeadInsert      │  │ 读几何缓存        │  │                   │  │
+│  │                 │  │ try_lock 不阻塞   │  │ 避免初始化循环等   │  │
+│  │ Default（首选） │  │ - main 窗口内     │  │ 待（踩坑 §3）      │  │
+│  │  ↳ 命中吞事件   │  │ - 不在辅助窗口上  │  │                   │  │
+│  │ ListenOnly      │  │ - 命中桌宠区域    │  │ 通道化：回调只    │  │
+│  │  ↳ 悬停切穿透   │  │                   │  │ try_send，独立线程 │  │
+│  └─────────────────┘  └──────────────────┘  │ emit（踩坑 §10）   │  │
+│                                             └───────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
                                 │ Tauri Event Bridge
                                 ▼
@@ -201,9 +204,16 @@
                                       │
                                       ▼
                               map_key_code() 键码映射
+                              + pressed_keys 位图更新
                                       │
                                       ▼
-                              ctx.app.emit_to("main", "key-press", key)
+                              ctx.tx.try_send(TapMsg::Key)   ← 回调内不阻塞
+                                      │
+                                      ▼
+                              input-emitter 线程 recv
+                                      │
+                                      ▼
+                              emit_to("main", "key-press", key)
                                       │
                                       ▼
                               WebView main Vue SPA 监听 key-press
@@ -211,6 +221,8 @@
                                       ▼
                               更新打字计数 / 桌宠响应
 ```
+
+> 全局键盘事件需要「输入监控」权限；只有辅助功能时 tap 为 ListenOnly，收不到 KeyUp/KeyDown，此时只有 main 窗口聚焦时的原生 keydown 会计数。
 
 #### 窗口创建流（以 panel 为例）
 
@@ -347,18 +359,44 @@ WKWebView 对"无活动"页面会执行 idle 挂起（JS 冻结、timer 停转�
 
 #### 文件位置
 
-- [input.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/input.rs) (539 行)
+- [input.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/input.rs) (864 行)
 
 #### 核心职责
 
 | 职责 | 实现 |
 |------|------|
-| 全局键鼠事件采集 | CGEventTap (HIDEventTap + HeadInsertEventTap，ListenOnly) |
-| 键码映射 | macOS virtual keycode → `KeyboardEvent.key` 风格字符串 |
+| 全局键鼠事件采集 | `CGEventTap`（HIDEventTap + HeadInsertEventTap），**Default / ListenOnly 双模式** |
+| 阻止点击穿透 | Default 模式下对桌宠区域内的 press/drag/up 返回 `null` 吞掉事件 |
+| 键码映射 | macOS virtual keycode → `KeyboardEvent.key` 风格字符串（覆盖 104 键 + 小键盘 + 功能键） |
 | 事件节流 | mouse-move 最小 16ms 间隔（约 60fps） |
-| 命中区域过滤 | `route_mouse_press()` per-region 判断 |
-| 权限自动处理 | 未授权时每 3s 轮询 AXIsProcessTrusted()，首次自动打开系统设置 |
-| tap 超时恢复 | runloop 分片运行，检测 TapDisabledByTimeout 自动重启 |
+| 命中区域过滤 | `hit_test()` per-region 判断（纯内存，读几何缓存） |
+| 双权限处理 | 辅助功能（`AXIsProcessTrusted`）+ 输入监控（`CGPreflightListenEventAccess` / `CGRequestListenEventAccess`） |
+| tap 超时恢复 | runloop 分片运行，`TapDisabledByTimeout` 自动 `tap_enable` 并**补发按键 release** |
+| 降级防穿透 | 无输入监控权限时，指针悬停桌宠即让 main 窗口接收鼠标（`apply_pointer_hover`） |
+
+#### 两种 tap 模式（关键设计）
+
+macOS 对 CGEventTap 的权限要求分两级，必须区分：
+
+| 模式 | 权限要求 | 能力 | 本移植中的用途 |
+|------|----------|------|----------------|
+| `CGEventTapOptions::Default` | 辅助功能 **+ 输入监控** | 可修改/吞掉事件（回调返回 `null`） | **首选**：桌宠区域点击不穿透桌面 |
+| `CGEventTapOptions::ListenOnly` | 仅辅助功能 | 只能观测，事件必然透传 | **降级**：点击会穿透到桌面 |
+
+启动逻辑（`run_worker`）：
+
+```
+CGPreflightListenEventAccess() == false
+  → 打开「系统设置 → 隐私与安全性 → 输入监控」
+  → 调 CGRequestListenEventAccess() 触发系统授权弹窗
+  → 先建 ListenOnly（保证鼠标事件能进来）
+  → 每 2s 复查权限，一旦授权立即 break 重建 Default tap（无需重启 App）
+
+CGPreflightListenEventAccess() == true
+  → 直接建 Default tap；失败则回退 ListenOnly
+```
+
+> **签名与授权持久性**：adhoc 签名（`signingIdentity: "-"`）每次编译 cdhash 都变，macOS TCC 会把新二进制当成新应用，之前的授权自动失效——这正是"给了权限却没用、过一会儿又失效"的机制性原因。发布版必须用**固定证书**（本机已配置 `WuwaTappo Dev Signing`）签名，授权才能跨编译保持。
 
 #### 事件协议
 
@@ -375,42 +413,68 @@ emit_to("main", "mouse-button", {"button": "left", "action": "press"})
 emit_to("main", "mouse-button", {"button": "right", "action": "release"})
 ```
 
-#### 线程模型
+#### 线程模型（零阻塞回调）
 
 ```
 主线程 (Tauri)
-  └── 窗口几何查询、菜单/托盘操作
+  ├── 窗口几何查询 / 菜单 / 托盘
+  ├── set_main_hit_region → refresh_main_geom（100ms 节流刷新几何缓存）
+  └── apply_pointer_hover（ListenOnly 降级时的穿透切换）
 
 global-input 线程 (worker)
-  ├── 权限等待循环（AXIsProcessTrusted 轮询）
+  ├── 权限探测与请求（辅助功能 / 输入监控）
   ├── 建立 CGEventTap
   ├── CFRunLoop::run_in_mode（分片 50ms）
-  │     └── event_tap_callback（RunLoop 线程串行执行）
-  │           ├── KeyDown/KeyUp → map_key_code → emit_key
-  │           ├── FlagsChanged → handle_flags_changed → emit_key
-  │           ├── MouseMoved/Dragged → 节流 → emit mouse-move
-  │           ├── MouseDown/Up → to_physical → emit_mouse_button
-  │           │     └── app.run_on_main_thread → route_mouse_press
+  │     └── event_tap_callback（必须微秒级返回）
+  │           ├── KeyDown/KeyUp → 维护 pressed_keys 位图 → try_send(TapMsg::Key)
+  │           ├── FlagsChanged → handle_flags_changed → try_send(TapMsg::Key)
+  │           ├── MouseMoved/Dragged → 节流 → try_send(TapMsg::Move)
+  │           ├── MouseDown → hit_test → try_send(TapMsg::Button) → 命中则 return null 吞掉
+  │           ├── MouseUp → try_send(TapMsg::Button) → 若本次按下属吞状态则 return null
   │           └── TapDisabled → needs_restart = true
-  └── 分片循环检测 needs_restart → CGEvent::tap_enable(true)
+  └── 分片循环：needs_restart → 补发 stale key-release → tap_enable(true)
+
+input-emitter 线程（独立）
+  └── 从 sync_channel(1024) 取 TapMsg → emit_to 前端 / 投递 Hover 到主线程
 ```
 
-#### 命中区域过滤算法 (`route_mouse_press`)
+**为什么必须通道化**：CGEventTap 回调超过系统阈值（约 0.25s）时，**该事件会被系统直接丢弃**。一旦 KeyUp 被丢，系统认为按键一直按着 → 触发键盘重复，表现为按 Cmd+Q 退出时字符疯狂刷屏。回调里任何 `emit_to` / 写盘 / `Mutex::lock` 都可能触发，因此全部移到独立线程，回调只做内存判断与 `try_send`（队列满则丢帧，绝不阻塞）。
+
+#### 命中区域过滤算法 (`hit_test`)
 
 ```
-输入：全局物理坐标 (gx, gy)
-  1. 点是否在 main 窗口可见区域内？
-     └── main.outer_position / outer_size 比较
-  2. 点是否命中辅助窗口（panel/login/toast 等）？
-     └── 遍历所有可见非 main 窗口
-     └── 命中辅助窗口 → 不路由（辅助窗口自行处理）
-  3. 全局物理坐标 → main 窗口内 CSS 逻辑坐标
-     └── lx = (gx - mpx) / scale, ly = (gy - mpy) / scale
-  4. 逻辑坐标是否命中 input_regions 或 visual_regions？
-     └── SharedMainHitState 中注册的区域列表
-  5. 命中 → 路由 mouse-button 事件给 main WebView
-     未命中 → 丢弃（避免穿透层误响应桌面点击）
+输入：CG 全局逻辑坐标 (gx, gy)
+  1. 读 SharedMainGeom 缓存（try_lock，避免回调被主线程持锁阻塞）
+     └── main 是否可见、main 的全局矩形 (x, y, w, h)
+  2. 点是否在 main 矩形内？否 → false
+  3. 点是否落在辅助窗口（panel/login/toast 等）矩形内？是 → false
+     （这些点击属于辅助窗口自己）
+  4. 转窗口内 CSS 逻辑坐标：lx = gx - mx, ly = gy - my
+     （CG 逻辑点与 Tauri outer_position 同为逻辑坐标，直接相减，不做 scale 换算）
+  5. 命中 input_regions 或 visual_regions → true
 ```
+
+**几何缓存（`MainGeom` / `SharedMainGeom`）**：tap 回调运行在独立线程，而 Tauri/tao 的窗口查询（`get_webview_window` / `outer_position` / `is_visible`）必须在主线程调用。直接在回调里查窗口 API 会导致进程不定时静默崩溃。因此命中测试只读这份由主线程（`refresh_main_geom`）维护的快照，缓存字段包含 main 几何、辅助窗口列表、前端 force-ignore 期望、指针是否在桌宠内。
+
+#### 按下键位图（`pressed_keys`）
+
+`TapContext.pressed_keys: AtomicU64` 记录 keycode < 64 的按键按下状态（位图）。用途：
+
+- tap 被系统禁用 → 重启时 `swap(0)` 取出所有"仍按下"的键，逐个补发 `key-release`
+- 前端 `index-DmC0wUEw.js` 的 `_c()/kc()` 用 `Pr` Set 做去重：**keyup 一旦丢失，该键会永久卡在 Set 里，表现为"计数器用一会儿就彻底不计数"**
+- 补发 release 是清理这一残留的唯一手段
+
+#### 降级防穿透（`apply_pointer_hover`）
+
+当只能建 ListenOnly（无输入监控权限）时，无法吞事件，因此改为**窗口级动态穿透**：
+
+| 指针位置 | `main.set_ignore_cursor_events` | 效果 |
+|----------|-------------------------------|------|
+| 在桌宠区域内 | `false`（接收） | 点击被窗口接住，不落到桌面 |
+| 在桌宠区域外 | 由 `front_force_ignore` 决定（默认 `true` 穿透） | 桌面正常使用 |
+
+切换只在跨越区域边界时发生（`pointer_in_pet` 状态变化才入队 `TapMsg::Hover`）。Default 模式下**不启用**该逻辑——窗口恒穿透，由 tap 吞事件，避免 WKWebView 原生 DOM 事件与前端合成事件冲突。
+
 
 ### 4.3 窗口管理与多窗口架构
 
@@ -421,7 +485,7 @@ global-input 线程 (worker)
 | `main` | 桌宠主窗口（全屏透明 shell） | `index.html` (根) | **tauri.conf.json 初始 320×420 → 前端启动后 fallback 为 2560×1440 全屏** | transparent, decorations=false, alwaysOnTop=true, skipTaskbar=true, ignoresMouseEvents **恒穿透** |
 | `toast` | Toast 提示 | `index.html` | 420×120 | transparent, alwaysOnTop=true, skipTaskbar=true |
 | `panel` | 背包/图鉴/兑换/房间/设置 | `index.html#/panel` | 1240×800 (min 同) | transparent, decorations=false, resizable=true, shadow=true, 不穿透 |
-| `login` | 登录窗口 | `index.html#/login` | 400×620 | transparent, decorations=false, resizable=false, 不穿透 |
+| `login` | 登录窗口 | `index.html#/login` | **520×440**（前端卡片固定 500×378，窗口必须容得下） | transparent, decorations=false, resizable=false, always_on_top=true, 不穿透 |
 | `update` | 更新窗口 | `index.html#/update` | 420×560 | transparent, decorations=false, resizable=false, 不穿透 |
 | `about` | 关于窗口 | `index.html#/about` | 420×520 | transparent, decorations=false, resizable=false, 不穿透 |
 | `oss-notice` | OSS 许可 | `index.html#/oss-notice` | 460×600 | transparent, decorations=false, resizable=true, 不穿透 |
@@ -430,12 +494,38 @@ global-input 线程 (worker)
 
 #### 交互管线（本移植的核心）
 
-官方 Windows 版用 Win32 per-region 命中测试（`WM_NCHITTEST`）实现"桌宠可点、空白处穿透"。macOS 等价实现为**恒穿透 + 事件桥 + 前端合成**：
+官方 Windows 版用 Win32 per-region 命中测试（`WM_NCHITTEST`）实现"桌宠可点、空白处穿透"。macOS 没有 per-region 窗口级命中测试，因此按权限分两条路径：
+
+**路径 A（首选，需「输入监控」权限）：Default tap 吞事件**
 
 ```
-CGEventTap（全局，ListenOnly）
+main 窗口恒穿透（ignoresMouseEvents = true）
+CGEventTap（Default，可修改事件）
+  │ MouseDown → hit_test()
+  │   命中桌宠区域 → emit mouse-button(press) → return null（吞掉，桌面收不到）
+  │   未命中       → emit mouse-button(press) → 原样透传
+  │ MouseUp/Dragged → 若本次按下属吞状态 → return null
+  │ KeyDown/KeyUp   → 永远不吞（吞 KeyUp 会触发系统按键重复）
+  ▼
+前端按 mouse-move 坐标 + elementFromPoint 合成点击/拖拽/右键
+```
+
+**路径 B（降级，仅「辅助功能」权限）：窗口动态穿透**
+
+```
+main 窗口初始穿透
+Pointer 进入桌宠区域 → set_ignore_cursor_events(false)（窗口开始接收鼠标）
+Pointer 离开桌宠区域 → set_ignore_cursor_events(true)（恢复穿透）
+  ▼
+点击被窗口接住（不落到桌面），前端仍靠合成事件处理交互
+```
+
+两条路径共用同一套前端事件协议：
+
+```
+CGEventTap
   │ mouse-move（物理像素，约 60fps 节流）
-  │ mouse-button（press/release × left/right，press 经 per-region 命中过滤）
+  │ mouse-button（press/release × left/right）
   │ key-press / key-release（KeyboardEvent.key 风格字符串）
   ▼
 emit → main 窗口前端
@@ -445,11 +535,25 @@ emit → main 窗口前端
   ▼
 前端把桌宠可交互区域经 set_main_hit_region 上报 Rust
   （inputRegions + regions，字段 left/top/width/height）
-  → Rust 侧 route_mouse_press 据此过滤：命中桌宠区域才转发 press，
-    点在辅助窗口上、或点在桌宠区域外 → 不转发（事件自然落到下层应用）
+  → 每次上报顺带刷新 SharedMainGeom 几何缓存（100ms 节流）
 ```
 
-**坐标换算**：CGEvent location 是全局逻辑点，emit 前按鼠标所在显示器 backing scale 乘算成物理像素；前端 `(全局物理坐标 − window.innerPosition) / scaleFactor` 还原为 CSS 坐标。
+**坐标换算**：CGEvent location 是全局逻辑点；`hit_test` 直接与 Tauri `outer_position`（同为逻辑坐标）相减得到窗口内 CSS 坐标。而 `mouse-move` 的 payload 需要**物理像素**（前端 `Ht()` 用 `(x − innerPosition) / scaleFactor` 还原），因此 emit 前按鼠标所在显示器 backing scale 乘算。
+
+#### main 与辅助窗口的层级关系（`sync_main_layer`）
+
+`main` 配置为 `alwaysOnTop: true` 且覆盖全屏，与 login/panel 同属 floating level。macOS 上同层窗口谁最后 `orderFront` 谁在上面，`main` 只要被激活就会盖住辅助窗口——实测出现过 `login: visible=true` 但用户完全看不见的情况。
+
+`sync_main_layer(app)` 的处理：
+
+```rust
+// 只要有可见的辅助窗口，就把 main 降为非置顶（normal level）
+let has_aux = webview_windows().iter()
+    .any(|(label, w)| label != "main" && w.is_visible().unwrap_or(false));
+main.set_always_on_top(!has_aux);
+```
+
+调用时机：`create_aux_window_min` 创建成功后、以及每个 `close_*_window` 关闭后。辅助窗口全部关闭时 main 恢复置顶，桌宠继续常在最前。
 
 #### 创建函数
 
@@ -471,9 +575,11 @@ fn create_aux_window_min<R: Runtime>(..., min_w: f64, min_h: f64) -> tauri::Resu
 
 #### 主窗口特殊设置
 
-- **恒穿透**：`set_main_force_cursor_ignore(true)` — main 窗口 WebView 忽略所有鼠标事件，桌宠交互完全由前端基于全局鼠标事件合成
+- **穿透与命中**：`set_main_force_cursor_ignore(enabled)` 不再直接透传参数，而是
+  `set_ignore_cursor_events(enabled && !pointer_in_pet)` —— 记录前端"希望穿透"的期望（`front_force_ignore`），但只要指针悬停在桌宠区域内就强制保持可点击，否则点击会落到桌面
 - **多工作区可见**：`set_visible_on_all_workspaces(true)` — 桌宠跨 Space 显示
 - **Dock 隐藏**：`LSUIElement=true` (Info.plist) — 不占 Dock 图标
+- **几何缓存**：`set_main_hit_region` / `set_main_window_content_bounds` / `sync_main_window_to_current_monitor` / `set_main_force_cursor_ignore` 等布局相关命令末尾都会调用 `refresh_main_geom`，把最新窗口外框写入 tap 线程可读的快照
 
 ### 4.4 托盘与右键菜单系统
 
@@ -679,51 +785,59 @@ app.emit("tray-set-pet-scale", 125.0)
 
 ### 5.2 input.rs 核心类型
 
-| 类型 | 位置 (行号) | 说明 |
-|------|------------|------|
-| `RegionRect` | L42-54 | 窗口内逻辑坐标矩形（包含 contains() 方法） |
-| `MainHitState` | L56-62 | 命中区域集合（input_regions + visual_regions） |
-| `SharedMainHitState` | L64 | 命中状态托管（Mutex<MainHitState>） |
-| `TapContext` | L248-253 | CGEventTap 回调上下文（跨线程共享） |
+| 类型 | 说明 |
+|------|------|
+| `RegionRect` | 窗口内 CSS 逻辑坐标矩形（含 `contains()`） |
+| `MainHitState` | 命中区域集合（`input_regions` + `visual_regions`） |
+| `SharedMainHitState` | 命中状态托管（`Mutex<MainHitState>`），前端 `set_main_hit_region` 写入 |
+| `MainGeom` | 窗口几何快照：main 的 visible/x/y/w/h、辅助窗口列表 `aux`、`front_force_ignore`、`pointer_in_pet` |
+| `SharedMainGeom` | 几何快照托管（`Mutex<MainGeom>`），tap 线程只读 |
+| `TapMsg` | tap 回调 → 发送线程的消息枚举：`Key` / `Move` / `Button` / `Hover` |
+| `TapContext` | CGEventTap 回调上下文：`app`、`last_move_ms`、`swallowing`、`pointer_in_pet`、`active_default`、`tx`、`pressed_keys`、`needs_tap_restart` |
 
 ### 5.3 关键函数
 
 #### lib.rs 函数
 
-| 函数 | 行号 | 签名 | 说明 |
-|------|------|------|------|
-| `run` | L1128 | `pub fn run()` | Tauri 应用主入口 |
-| `rebuild_tray_menu` | L1001 | `fn rebuild_tray_menu(app, st) → Result<()>` | 重建托盘菜单（按 TrayState） |
-| `build_dock_menu` | L1011 | `pub fn build_dock_menu(app, st) → Result<Menu>` | 构建桌宠菜单（托盘/右键共用） |
-| `handle_menu_event` | L1066 | `fn handle_menu_event(app, id)` | 菜单项事件分发 |
-| `create_aux_window_min` | L651 | `fn create_aux_window_min(app, label, route, title, w, h, resizable, min_w, min_h) → Result<()>` | 带最小尺寸的辅助窗口创建 |
-| `open_panel` | L692 | `fn open_panel(app, tab) → Result<()>` | 打开 panel 并聚焦 tab |
-| `dlog` | L265 | `pub fn dlog(msg: &str)` | 双写诊断日志（stdout + /tmp 文件） |
-| `chrono_date` | L231 | `fn chrono_date() → String` | YYYYMMDD 日期（自实现 civil_from_days） |
-| `chrono_time` | L242 | `fn chrono_time() → String` | HH:MM:SS 时间 |
-| `store_path` | L870 | `fn store_path(app) → Result<PathBuf>` | 本地存储路径解析 |
-| `store_read` | L880 | `fn store_read(app) → Value` | 读取 store.json |
-| `store_write` | L890 | `fn store_write(app, v)` | 写入 store.json |
+| 函数 | 签名 | 说明 |
+|------|------|------|
+| `run` | `pub fn run()` | Tauri 应用主入口 |
+| `rebuild_tray_menu` | `fn rebuild_tray_menu(app, st) → Result<()>` | 重建托盘菜单（按 TrayState） |
+| `build_dock_menu` | `pub fn build_dock_menu(app, st) → Result<Menu>` | 构建桌宠菜单（托盘/右键共用） |
+| `handle_menu_event` | `fn handle_menu_event(app, id)` | 菜单项事件分发 |
+| `create_aux_window_min` | `fn create_aux_window_min(app, label, route, title, w, h, resizable, min_w, min_h) → Result<()>` | 带最小尺寸的辅助窗口创建（创建后 `sync_main_layer` + 刷新几何） |
+| `sync_main_layer` | `fn sync_main_layer(app)` | 有辅助窗口时把 main 降为非置顶，全部关闭后恢复 |
+| `open_panel` | `fn open_panel(app, tab) → Result<()>` | 打开 panel 并聚焦 tab |
+| `dlog` | `pub fn dlog(msg: &str)` | 双写诊断日志（stdout + /tmp 文件） |
+| `chrono_date` / `chrono_time` | `fn → String` | 自实现日期/时间格式化 |
+| `store_path` / `store_read` / `store_write` | — | 本地 store.json 读写 |
 
 #### input.rs 函数
 
-| 函数 | 行号 | 签名 | 说明 |
-|------|------|------|------|
-| `start` | L439 | `pub fn start(app: AppHandle)` | 启动全局输入监听（非阻塞，spawn worker） |
-| `run_worker` | L446 | `fn run_worker(app: AppHandle)` | worker 主循环（权限等待 → tap 建立 → runloop） |
-| `event_tap_callback` | L365 | `unsafe extern "C-unwind" fn event_tap_callback(...)` | CGEventTap 回调（ListenOnly，事件原样透传） |
-| `route_mouse_press` | L105 | `fn route_mouse_press(app, gx, gy) → bool` | 鼠标按下命中区域过滤 |
-| `handle_mouse_button` | L151 | `pub fn handle_mouse_button(app, gx, gy, right, press)` | 鼠标按钮事件处理（主线程） |
-| `mark_input_bridge_ready` | L260 | `pub fn mark_input_bridge_ready(app)` | 前端握手回调（仅日志观测） |
-| `parse_regions` | L69 | `pub fn parse_regions(v: Option<&Value>) → Vec<RegionRect>` | 宽松解析前端上报的 regions |
-| `map_key_code` | L289 | `fn map_key_code(code: u16) → Option<&'static str>` | macOS virtual keycode → KeyboardEvent.key |
-| `handle_flags_changed` | L338 | `fn handle_flags_changed(ctx, code, flags)` | FlagsChanged 修饰键处理 |
-| `to_physical` | L218 | `fn to_physical(x, y) → (f64, f64)` | CG 逻辑点 → 物理像素（找显示器 scale） |
-| `emit_key` | L277 | `fn emit_key(ctx, key, pressed)` | emit key-press/key-release 事件 |
-| `emit_mouse_button` | L356 | `fn emit_mouse_button(ctx, gx, gy, right, press)` | emit mouse-button 事件 |
-| `event_mask` | L419 | `fn event_mask() → CGEventMask` | 构造 CGEventTap 监听 mask |
+| 函数 | 签名 | 说明 |
+|------|------|------|
+| `start` | `pub fn start(app: AppHandle)` | 启动全局输入监听（非阻塞，spawn worker） |
+| `run_worker` | `fn run_worker(app: AppHandle)` | worker 主循环（权限探测 → tap 建立 → runloop 分片 → 超时重启/权限升级） |
+| `event_tap_callback` | `unsafe extern "C-unwind" fn(...) → *mut CGEvent` | tap 回调：纯内存判断 + `try_send`，命中桌宠则返回 `null` 吞事件 |
+| `hit_test` | `pub fn hit_test(app, gx, gy) → bool` | 命中测试（读几何缓存，`try_lock`） |
+| `refresh_main_geom` | `pub fn refresh_main_geom(app)` | 主线程刷新几何缓存（100ms 节流） |
+| `apply_pointer_hover` | `pub fn apply_pointer_hover(app, in_pet)` | ListenOnly 降级：按指针位置切换窗口穿透 |
+| `spawn_emitter` | `fn spawn_emitter(app, rx)` | 独立发送线程：从 channel 取消息并 emit 给前端 |
+| `update_pointer_mode` | `fn update_pointer_mode(ctx, gx, gy)` | 跨越桌宠边界时入队 `Hover`（Default 模式不启用） |
+| `emit_key` | `fn emit_key(ctx, key, pressed)` | 入队 `TapMsg::Key` |
+| `emit_mouse_button` | `fn emit_mouse_button(ctx, right, press)` | 入队 `TapMsg::Button` |
+| `handle_mouse_button_now` | `pub fn handle_mouse_button_now(app, right, press)` | 直接 emit mouse-button（供非 tap 路径调用） |
+| `mark_input_bridge_ready` | `pub fn mark_input_bridge_ready(app)` | 前端握手回调（仅日志观测） |
+| `parse_regions` | `pub fn parse_regions(v) → Vec<RegionRect>` | 宽松解析前端上报的 regions（兼容 x/left、y/top） |
+| `map_key_code` | `fn map_key_code(code) → Option<&'static str>` | macOS virtual keycode → KeyboardEvent.key |
+| `handle_flags_changed` | `fn handle_flags_changed(ctx, code, flags)` | FlagsChanged 修饰键处理 |
+| `to_physical` / `display_scale_at` | `fn → (f64, f64)` / `fn → f64` | CG 逻辑点 → 物理像素（查鼠标所在显示器 scale） |
+| `listen_event_granted` | `fn listen_event_granted() → bool` | 查询「输入监控」权限（`CGPreflightListenEventAccess`） |
+| `event_mask` | `fn event_mask() → CGEventMask` | 构造 CGEventTap 监听 mask |
 
 ### 5.4 lib.rs 命令处理器完整清单
+
+> 共 50 个命令，按官方签名 1:1 重建。行号为编写时快照，改动后以函数名为准。
 
 | # | 命令函数 | 行号 | 返回类型 | 分类 |
 |---|---------|------|----------|------|
@@ -921,6 +1035,11 @@ strip = true           # 去除调试符号
 | `cargo tauri` | 2.x | tauri-cli（`cargo install tauri-cli` 或 Rustup 插件） |
 | 辅助功能授权 | 必需 | CGEventTap 监听全局键鼠事件 |
 
+| 权限 | 用途 | 说明 |
+|------|------|------|
+| 辅助功能（Accessibility） | CGEventTap（ListenOnly 亦可） | 鼠标/键盘事件采集的基础权限 |
+| **输入监控（Input Monitoring）** | Default tap（可吞事件） | **点击不穿透桌面 + 全局键盘计数**必需；缺失时只能降级 |
+
 ### 8.2 克隆与构建
 
 ```bash
@@ -935,9 +1054,20 @@ cargo tauri build --bundles app
 
 # 出 .app + .dmg
 cargo tauri build
+
+# 使用固定证书签名（推荐，授权可跨编译保持）
+APPLE_SIGNING_IDENTITY="WuwaTappo Dev Signing" cargo tauri build --bundles app
 ```
 
 产物位置：`src-tauri/target/release/bundle/`
+
+**签名验证**：
+
+```bash
+codesign -dv src-tauri/target/release/bundle/macos/WuwaTappo.app
+# adhoc（不可持久授权）: Signature=adhoc
+# 固定证书（可持久）    : Signature size=1649
+```
 
 ### 8.3 开发构建
 
@@ -950,18 +1080,33 @@ cargo build
 # 运行开发版本
 cargo tauri dev
 
-# 产物: src-tauri/target/debug/wuwa-tappo-macos
+# 产物: src-tauri/target/debug/wuwatappo-macos
 ```
 
 ### 8.4 运行（首次必读）
 
 **⚠️ 测试时必须 `open WuwaTappo.app`（LaunchServices）启动——直接执行二进制会触发 WKWebView 挂起伪影（表现为桌宠无响应、计数停止），得到假 bug。**
 
+**⚠️ 重启前务必先杀干净旧实例**（bundle id 相同会复用旧进程，导致"改了代码没效果"）：
+
+```bash
+pkill -9 -f wuwatappo; sleep 1
+open src-tauri/target/release/bundle/macos/WuwaTappo.app
+```
+
 首次启动三步：
 
-1. **辅助功能授权**：全局键鼠监听（计数 / 拖拽 / 点击）需要 系统设置 → 隐私与安全性 → 辅助功能 中勾选本应用。未授权时应用会自动弹出该面板，授权后约 3 秒自动生效，**无需重启**。
-2. **adhoc 签名提示**：本仓库未配置开发者证书（`signingIdentity: "-"`）。自己编译的版本未公证，首次打开需右键 → 打开；且**每次重新编译都被 macOS 视为新应用，辅助功能授权会失效需重新勾选**（见踩坑 §5）。从 Release 下载的版本不受此影响（签名固定）。
-3. 授权后等待输入桥握手完成，桌宠即可响应键鼠事件。
+1. **辅助功能授权**：系统设置 → 隐私与安全性 → 辅助功能 勾选本应用。未授权时应用会自动打开该面板，授权后约 3 秒自动生效。
+2. **输入监控授权**：系统设置 → 隐私与安全性 → **输入监控** 勾选本应用。这是 **Default tap（吞事件/全局键盘）** 的前提；未授权时 `/tmp/wuwatappo-input.log` 显示 `listen-only`，表现为点击穿透桌面、只有窗口聚焦时按键才计数。授权后重启 App 生效（或等代码内 2s 轮询自动升级）。
+3. **签名与授权持久性**：`signingIdentity: "-"`（adhoc）时每次编译 cdhash 都变，macOS 视为新应用，**之前的授权全部失效**。要避免反复授权，请用固定证书签名（见 8.2）。
+
+验证当前 tap 模式：
+
+```bash
+cat /tmp/wuwatappo-input.log
+# default/swallow  → 输入监控已授权，点击不穿透
+# listen-only      → 缺输入监控，点击会穿透
+```
 
 ### 8.5 前端修改（踩坑 §1）
 
@@ -983,22 +1128,31 @@ rm -rf ~/Library/Caches/com.kuro.wuwatappo.cn
 
 > **不要**删 `~/Library/WebKit/<id>/WebsiteData`，那是 localStorage / 登录态。
 
-### 8.7 辅助功能授权（详细）
+### 8.7 权限授权（详细）
 
-首次运行时全局输入监听不会自动生效。系统会自动打开辅助功能设置面板：
+需要**两个独立**的 TCC 开关，缺一不可：
 
 ```
-系统设置 → 隐私与安全性 → 辅助功能 → 勾选 WuwaTappo
+系统设置 → 隐私与安全性 → 辅助功能   → 勾选 WuwaTappo（CGEventTap 能建立）
+系统设置 → 隐私与安全性 → 输入监控   → 勾选 WuwaTappo（可吞事件 + 收到键盘事件）
 ```
 
-未授权时：输入日志 `/tmp/wuwatappo-input.log` 会显示 `NOT granted`，表现为"面板内点击正常，但桌宠点击/拖拽/打字计数全部失效"。
+| 已授权 | tap 模式 | 表现 |
+|--------|----------|------|
+| 都没有 | 建不起来 | `/tmp/wuwatappo-input.log` 显示 `CGEventTapCreate failed`，桌宠点击/拖拽/计数全灭 |
+| 仅辅助功能 | `listen-only` | 鼠标事件能进来、点击可响应，但**点击穿透桌面**且**收不到键盘**（只有窗口聚焦时原生 keydown 计数） |
+| 辅助功能 + 输入监控 | `default/swallow` | 完整功能：点击不穿透、全局键盘计数、拖拽正常 |
+
+输入监控缺失时，App 启动会自动打开该设置页并调用 `CGRequestListenEventAccess()` 触发系统授权弹窗。授权后**需重启 App**（TCC 对已运行进程不刷新），或等代码内每 2 秒的轮询自动升级。
+
+> 若每次重新编译后授权都失效，说明当前是 adhoc 签名（见踩坑 §5）。改用固定证书签名后，授权可跨编译保持。
 
 ### 8.8 诊断工具
 
 | 工具 | 位置 | 用途 |
 |------|------|------|
 | 命令序列日志 | `/tmp/wuwatappo-diag.log` | 所有 50 个命令入口 + hit-region payload/解析结果双写，定位前端初始化链断点 |
-| 输入权限日志 | `/tmp/wuwatappo-input.log` | 出现 `NOT granted` = 辅助功能未授权（tap 未建立） |
+| 输入模式日志 | `/tmp/wuwatappo-input.log` | `default/swallow` = 输入监控已授权（吞事件）；`listen-only` = 只有辅助功能（点击穿透且收不到键盘） |
 | 启动诊断 | 前 2 分钟 diag 行 | 窗口几何 / bridge_ready / regions 数量快照 |
 | 应用日志 | `$APPLOCALDATA/logs/app-YYYYMMDD.log` | 前端 onerror/unhandledrejection + 10s 心跳（WKWebView 的 console 不可见） |
 | 存储数据 | `$APPLOCALDATA/native-store/store.json` | 打字计数 / 点击计数持久化 |
@@ -1040,10 +1194,15 @@ cat ~/Library/Application\ Support/com.kuro.wuwatappo.cn/native-store/store.json
 | 1 | **全屏 shell 恒穿透** | 对齐官方 Windows WM_NCHITTEST 语义；桌宠的点击/拖拽/右键菜单全部由前端基于全局鼠标事件合成 | main 窗口设置 + input.rs per-region 过滤 |
 | 2 | **CGEventTap HIDEventTap + HeadInsertEventTap** | BongoCat 参考；session tail 的 tap 会丢失部分 FlagsChanged（右 Shift 释放） | input.rs tap 建立逻辑 |
 | 3 | **事件直转无门控** | 曾做"emit 等握手"门控，但前端初始化链的 await 可能依赖首批事件 → 形成**循环等待**（前端初始化链 await mouse-move 布局 → 门控等握手 → 握手永远不来 → 初始化链永久中断，症状随编译产物时序漂移——"时好时坏"的根源）。已回退：事件始终直转，`notify_input_bridge_ready` 仅作日志观测 | input.rs + notify_input_bridge_ready |
-| 4 | **辅助窗口遮挡判定** | 辅助窗口（panel/login/toast）不穿透，点击应归属它们自己；mouse-down 需排除辅助窗口区域 | route_mouse_press() |
+| 4 | **辅助窗口遮挡判定** | 辅助窗口（panel/login/toast）不穿透，点击应归属它们自己；mouse-down 需排除辅助窗口区域 | hit_test() |
 | 5 | **裸数字返回打字计数** | 官方如此：`load_key_press_count` 返回裸 i64（前端 `Number(payload)` 解析），`load_cumulative_click_count` 返回对象。重建命令时勿"统一"格式，前端按官方格式解析 | load_key_press_count 返回 i64 |
 | 6 | **Keep-alive eval("void 0")** | WKWebView 会对"无活动"页面执行 **idle 挂起**（JS 冻结、timer 停转）——用户点开登录窗后 main 页面即被冻结，表现为"按键统计停止、桌宠无响应"（Windows WebView2 无此行为）。每 5 秒对所有窗口 eval("void 0") 维持活跃 | setup() 后台线程 |
-| 7 | **lib.rs 单文件 1334 行** | 命令处理器密集时集中管理更易维护，避免多文件组织复杂度 | 整个 lib.rs |
+| 7 | **lib.rs 单文件** | 命令处理器密集时集中管理更易维护，避免多文件组织复杂度 | 整个 lib.rs |
+| 8 | **Default tap 优先、ListenOnly 降级** | macOS 只有 Default（active）tap 能吞事件实现"点击不穿透"，但它额外要求「输入监控」权限；ListenOnly 只需「辅助功能」但点击必穿透且收不到键盘。因此运行时按权限探测结果动态选择，并在拿到权限后热切换 | run_worker() |
+| 9 | **通道化事件发送** | tap 回调超时会让事件被系统丢弃（KeyUp 丢失 → 按键重复刷屏）。回调只做内存判断 + `try_send`，emit/写盘/主线程 API 全部移到 `input-emitter` 线程 | TapMsg + spawn_emitter |
+| 10 | **几何缓存替代实时窗口查询** | Tauri 窗口 API 必须在主线程；在 tap 线程调用会导致进程静默崩溃。改为主线程维护 `SharedMainGeom` 快照，回调只读 | MainGeom + refresh_main_geom |
+| 11 | **辅助窗口打开时降 main 层级** | main 是全屏 alwaysOnTop 窗口，与辅助窗口同层会盖住它们（login 可见状态为 true 但看不见）。`sync_main_layer` 按辅助窗口可见性动态切换 main 的置顶 | sync_main_layer |
+| 12 | **固定证书签名** | adhoc 签名每次编译 cdhash 变化，TCC 授权失效，用户被迫反复授权。改用固定证书（`WuwaTappo Dev Signing`）后授权跨编译保持 | 构建流程 |
 
 ### 9.2 开发者必读：macOS 移植踩坑记录（改相关代码前必读）
 
@@ -1063,7 +1222,8 @@ touch src-tauri/src/lib.rs && cargo tauri build --bundles app
 官方 `isdkSrc:"//pro-cdn-sdk.kurogame.com/..."` 在 Windows（`https://tauri.localhost`）下正常，在 macOS（`tauri://localhost`）下解析成 `tauri://pro-cdn-sdk...` → SDK 加载失败 → 登录窗口是透明无边框窗口、页面空白 → **整窗不可见**，用户看到"点了登录什么都没发生"。修复：改为 `https://` 绝对地址。
 
 **§5 adhoc 签名 → TCC 授权失效**
-`signingIdentity: "-"` 每次重编译 cdhash 都变，macOS 视为新应用，辅助功能授权自动失效。症状：键盘 / 全局点击 / 拖拽全灭，但面板内点击正常（不走全局监听）——**"只有面板内点击有反应"≈ tap 没建立**。诊断：看 `/tmp/wuwatappo-input.log` 是否有 `NOT granted`。根治方案（未做）：固定 self-signed codesigning 证书。
+`signingIdentity: "-"` 每次重编译 cdhash 都变，macOS 视为新应用，辅助功能 / 输入监控授权自动失效。症状：键盘 / 全局点击 / 拖拽全灭，但面板内点击正常（不走全局监听）——**"只有面板内点击有反应"≈ tap 没建立**。诊断：`/tmp/wuwatappo-input.log` 的 `tap mode` 行。
+**已配置固定证书** `WuwaTappo Dev Signing`（钥匙串中已信任）：`APPLE_SIGNING_IDENTITY="WuwaTappo Dev Signing" cargo tauri build --bundles app`，签名验证 `Signature size=1649`（而非 `adhoc`）。用固定证书后，TCC 授权可跨编译保持，**只需授权一次**。
 
 **§6 hit_region 字段名是 left/top 不是 x/y**
 前端上报矩形用 `left/top/width/height`。Rust 解析只认 `x/y` 时**不报错、静默返回 0 区域** → 桌宠点击 / 拖拽全被路由层过滤、事件穿透到桌面框选。现在已做双字段兼容。另外：`set_main_hit_region` 里**绝不能再调 `set_ignore_cursor_events`**（恒穿透只需启动时 `set_main_force_cursor_ignore(true)` 一次；重复调用一旦 Err，前端会报 hit_region_sync failed 并跳过后续同步）。
@@ -1077,13 +1237,32 @@ nohup / 直接执行二进制启动会触发 WKWebView 挂起伪影，得到假 
 **§9 计数命令返回格式不一致（官方如此）**
 `load_key_press_count` 返回裸 i64（前端 `Number(payload)` 解析），`load_cumulative_click_count` 返回对象。重建命令时勿"统一"格式，前端按官方格式解析。
 
+**§10 tap 回调阻塞 → KeyUp 被系统丢弃 → 按键疯狂重复**
+CGEventTap 回调超过系统阈值（约 0.25s）时，**该事件会被直接丢弃**。曾经在回调里直接 `emit_to` / `dlog` 写盘 / `app.state()` 查询，一旦 KeyUp 被丢，系统认为按键一直按着 → 触发键盘重复。实测症状：**按 Cmd+Q 退出时字符刷屏，必现**。
+修复：回调改为「纯内存判断 + `try_send`」，所有 emit / 写盘 / 主线程 API 移到独立 `input-emitter` 线程；`hit_test` 用 `try_lock` 不再可能阻塞在几何锁上。
+
+**§11 计数器"用一会儿就彻底失效"**
+前端 `index-DmC0wUEw.js` 的 `_c()/kc()` 用 `Pr` Set 做按键去重：keydown 时 `Pr.add(key)`，keyup 时 `Pr.delete(key)`。**keyup 一旦丢失（tap 被系统禁用期间），该键会永久卡在 Set 里**，后续按同一键会命中 `Pr.has(e)` 直接 return，表现为计数彻底失效。
+修复：`TapContext.pressed_keys`（`AtomicU64` 位图）记录按下状态；tap 被禁用重启时 `swap(0)` 取出所有仍按下的键，逐个补发 `key-release`，清理前端残留。
+
+**§12 tap 线程禁止调用窗口 API**
+Tauri/tao 的 `get_webview_window` / `outer_position` / `is_visible` 必须在主线程。曾在 tap 回调里直接调用做命中测试，导致进程**不定时静默崩溃**（用户侧表现为"程序莫名消失"）。
+修复：主线程维护 `SharedMainGeom` 几何快照（`refresh_main_geom`，100ms 节流），tap 回调只读快照。
+
+**§13 全屏 main 窗口会盖住辅助窗口**
+`main` 是 `alwaysOnTop: true` 的全屏 floating 窗口，与 login/panel 同层。macOS 同层窗口按最后 `orderFront` 排序，main 一旦被激活就盖住辅助窗口——实测出现 `login: visible=true` 但用户完全看不见。
+修复：`sync_main_layer` —— 只要有可见辅助窗口就把 main 降为非置顶，全部关闭后恢复。注意**不要**用 `set_background_color` 给辅助窗口铺底色（会在圆角卡片外露出方形色块）。
+
+**§14 Cmd+Q 退出后旧实例复用**
+bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代码没效果"。每次测试前必须 `pkill -9 -f wuwatappo` 再 `open`。
+
 ### 9.3 Win32 → macOS 降级映射
 
 | Windows 专属 API | macOS 等价 | 说明 |
 |-----------------|------------|------|
-| `WM_NCHITTEST` per-region 命中 | `route_mouse_press()` 逻辑判定 | Win32 原生消息路由；macOS 纯逻辑过滤 |
-| `SetWindowRgn` 区域穿透 | `set_ignore_cursor_events(true)` | macOS WebKit 原生穿透支持 |
-| `SetCapture` 鼠标捕获 | 全局 CGEventTap ListenOnly + 事件合成 | macOS 无等价捕获，靠全局事件桥兜底 |
+| `WM_NCHITTEST` per-region 命中 | `hit_test()` 逻辑判定 + Default tap 吞事件 | Win32 原生消息路由；macOS 靠"吞事件"或"窗口动态穿透"两条路径 |
+| `SetWindowRgn` 区域穿透 | `set_ignore_cursor_events(true/false)` | macOS WebKit 原生穿透支持 |
+| `SetCapture` 鼠标捕获 | 全局 CGEventTap + 事件合成 | macOS 无等价捕获，靠全局事件桥兜底 |
 | `HMENU` 坐标弹出 | `Muda ContextMenu::popup()` | 原生 NSMenu 跟随鼠标位置弹出 |
 | `RegisterHotKey` 全局热键 | 当前未实现（预留） | 可通过 CGEventTap + 前端逻辑实现 |
 | `SetWindowsHookEx` 键鼠 hook | `CGEventTap` | macOS 官方全局事件监听 API |
@@ -1096,7 +1275,7 @@ nohup / 直接执行二进制启动会触发 WKWebView 挂起伪影，得到假 
 |------|------|--------|
 | **无 darwin 更新通道** | 官方 updater 服务器仅有 windows-x86_64 条目，darwin 目标缺失；跟随官方版本需手动更新前端 dist 并重编译 | 低（社区移植，不影响核心功能） |
 | **联机房间 / 开箱等玩法** | 依赖官方服务端可用性，与官方 exe 端同源同命运 | 低（非本项目控制范围） |
-| **辅助功能需手动授权** | adhoc 签名每次重编译会失效，需重新勾选（详见踩坑 §5） | 中（开发期频繁） |
+| **辅助功能 + 输入监控需授权** | 两个独立 TCC 开关：辅助功能决定能否建 tap，输入监控决定能否 **吞事件 / 监听键盘**。用固定证书签名后授权可跨编译保持（详见踩坑 §5） | 中 |
 | **全屏 shell 未实现** | `set_main_window_fullscreen_shell` 故意返回 Err，前端用 window API fallback（功能等价但实现路径不同） | 中 |
 | **小键盘 / JIS 键盘键码映射** | 经 BongoCat 表校准，未在全键盘布局实测 | 低 |
 | **dmg 未公证** | adhoc 签名，他人下载首次打开需右键 → 打开 | 低 |
@@ -1122,10 +1301,10 @@ nohup / 直接执行二进制启动会触发 WKWebView 挂起伪影，得到假 
 
 | Event Name | Payload | 触发场景 |
 |------------|---------|----------|
-| `key-press` | `"W"`, `"F5"`, `"Shift"`, `"ArrowUp"` | 用户按键（由 CGEventTap 触发） |
-| `key-release` | 同上 | 按键释放 |
+| `key-press` | `"W"`, `"F5"`, `"Shift"`, `"ArrowUp"` | 用户按键（CGEventTap → 通道 → emitter 线程）**需输入监控权限** |
+| `key-release` | 同上 | 按键释放（tap 重启时会补发 stale release） |
 | `mouse-move` | `{x: 1440.0, y: 900.0}` (物理像素) | 鼠标移动（节流到 60fps） |
-| `mouse-button` | `{button: "left"|"right", action: "press"|"release"}` | 鼠标按下/释放 |
+| `mouse-button` | `{button: "left"|"right", action: "press"|"release"}` | 鼠标按下/释放（不因命中与否而丢弃，前端自行判定） |
 | `dock-open-panel` | `"bag"`, `"atlas"`, `"exchange"`, `"room"`, `"settings"` | 托盘左键点击 / 打开菜单项 |
 | `tray-toggle-pet-visibility` | `()` | 菜单项：隐藏/显示桌宠 |
 | `tray-toggle-window-passthrough` | `()` | 菜单项：点击穿透切换 |
