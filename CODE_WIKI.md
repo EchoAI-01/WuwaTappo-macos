@@ -1540,6 +1540,36 @@ P3  重新打包 dmg（当前 bundle 内 dmg 是 10-27 adhoc 旧版）+ 固定�
 
 ---
 
+## 12. 1.0.3 升级实施（2026-11-02）
+
+### 12.1 官方 1.0.3 vs 1.0.1 差异（双层解壳 + PE phf 表 brotli 提取全部 126 资产比对）
+
+**变更**：
+- **游戏模式**：检测到其他应用全屏 → 自动进入（禁用桌宠交互）；设置项 `gameMode` / `autoGameModeOnFullscreen`（localStorage wuwatappo-settings）；托盘事件 `tray-toggle-game-mode`；进入/退出遥测 `game_mode_entered/exited`
+- **自定义快捷键**：默认 F7=gameMode、F8=switchScreen、F9=togglePet（`DEFAULT_APP_SHORTCUTS`）；新命令 `get_app_shortcuts` / `set_app_shortcuts` / `set_shortcut_capture`；事件 `app-shortcut`（触发，payload=action 名）、`app-shortcuts-changed`（配置广播）；`set_app_shortcuts` 错误契约 = Err 字符串 `"duplicate"`/`"occupied"`（前端 String(e) 精确匹配）
+- **登录窗拖拽**：`startLoginWindowDrag` = 纯前端 mousedown → `window.startDragging()`（capabilities 已有 start-dragging，无需 Rust 改动）
+- 主 bundle `index-D8GJxFG7` → `index-CuzHFfJW`；房间/panel chunk `index-DmC0wUEw` → `index-pp8VWaUF`；chunk 重新分割（7→10 个小 chunk）；新增美术（金宝箱、emote_idle/threaten、role_1502 body_3 等）
+- **不变**：useLogin 字节级相同（登录链路零改动）、modalBridge 事件契约一致、官方 50 命令全保留、`ey()`（原 `Ig()`）socket 默认地址结构原样
+
+**快捷键编码契约**（main bundle `eventModifiers`/`keyFromEvent`/`shortcutFromEvent`）：
+- modifiers 位编码：Alt(Option)=1 | Ctrl=2 | Shift=4 | Meta(Cmd)=8
+- key = DOM keyCode：F1-F24 = 111+n（F7=118）、字母 = 大写 ASCII、数字 = 48-57、namedKeys 表（Space=32、方向键 37-40 等）
+- 约束：key<112（非 F 键）时必须带 Ctrl/Alt/Meta 之一（`n&11`），否则视为无效绑定
+- 按键捕获在**前端 DOM keydown**（ShortcutInput 组件）完成；`set_shortcut_capture {active}` 仅告知 Rust 暂停全局触发（避免录入时 F7-F9 误发动作）
+
+**游戏模式检测契约**：前端 `refreshDesktopMetrics` 调 `get_main_desktop_safe_area`，读返回的 `foregroundApplicationFullscreen` 布尔字段 → `Ph(Sv())` → 状态变化时 `Ga()` 写设置 + 广播 `SETTINGS_GAME_MODE_EVENT`（纯前端事件，无 Rust 参与）。
+
+### 12.2 macOS 壳实现
+
+- **`fullscreen.rs`（新模块）**：CGWindowListCopyWindowInfo(OnScreenOnly) 遍历在屏窗口，存在 layer==0、非本进程、bounds 完整覆盖主显示器（CGRectMakeWithDictionaryRepresentation 解析）的窗口即判定全屏。窗口列表无需屏幕录制权限（仅窗口名需要）；普通"最大化"不覆盖菜单栏不误判；桌宠自身窗口 layer 3/4 天然排除。手写 CoreGraphics/CoreFoundation FFI（crate feature 不全）。
+- **快捷键系统（lib.rs）**：`AppShortcuts(Mutex<HashMap<String,ShortcutBinding>>)` + `ShortcutCapture(AtomicBool)`；持久化复用 native-store/store.json 的 `app_shortcuts` 键；`set_app_shortcuts` 做 duplicate 校验后 emit `app-shortcuts-changed` 全窗广播。
+- **触发链（input.rs）**：`TapMsg::Key` 扩展携带 (CGKeyCode, CGEventFlags)；emitter 线程（非 tap 回调——回调禁止加锁）对 press 沿调 `crate::match_shortcut`：capture 模式跳过 → `dom_key_from_cg`（kVK→DOM keyCode 映射表）+ `dom_mods_from_cg`（CGEventFlags→位编码）→ 查表命中则 emit `app-shortcut`(action) 给 main 并**吞掉 key-press**（快捷键不计入打字计数）。
+- **前端补丁平移（4 项全重放，见 README 补丁清单）**：应用名统一（102 处）、isdkSrc/isdkCss https、`ey()` → `http://127.0.0.1:17321`（ws 代理）、key-press 注册后注入 `notify_input_bridge_ready`（改用 `__TAURI_INTERNALS__.invoke` 直呼，不依赖 chunk 内包装符号）。
+
+### 12.3 1.0.3 资产提取方法（复刻用）
+
+官方 exe 无 NSIS 二层（1.0.3 setup 7zz 直接解析失败）：python 扫 `NullsoftInst` magic + 内嵌 PE 头（MZ+PE\0\0）定位 blob 偏移 → 切割 → 7zz 解出主程序 PE（`$_21_`）→ 资产为 **brotli** 压缩嵌于 .rdata（非 gzip）；路径明文 `/assets/xxx` 可扫 → 解析 PE 节表算路径字符串 VA → 搜 8 字节 LE VA（phf entry key 指针）→ entry 布局 `[hash u64][key_ptr][key_len][data_ptr][data_len]`（key_len 校验）→ data 切出 brotli -d。脚本见 git 历史（.tmpfiles/extract-103 为提取产物）。
+
 ## 附录 A：版本历史
 
 | 版本 | 日期 | 内容 |

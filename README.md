@@ -53,7 +53,7 @@
 
 ## 功能特性与状态
 
-> 版本说明：仓库壳版本标记为 **v0.0.1-Beta**；`Cargo.toml` / `tauri.conf.json` 中的版本号 `1.0.1` 沿袭官方前端资产版本，便于对应官方功能集。
+> 版本说明：当前壳版本 **1.0.3-beta**（跟随官方 1.0.3 前端资产；beta 后缀表示社区移植测试版）。历史：1.0.1-beta 为首个登录+联机全打通版本。
 
 | 功能 | 状态 | 说明 |
 |---|---|---|
@@ -68,6 +68,9 @@
 | 开箱 / 合成 / 收藏 / 兑换码 | ⚠️ 待实测 | 官方玩法 API，完整验证依赖登录 |
 | 自动更新 | ❌ | 官方 updater 无 darwin 通道，恒显示"无更新" |
 | 开机自启动 | ✅ | LaunchAgent（`tauri-plugin-autostart`） |
+| 游戏模式（1.0.3） | ✅ | 检测其他应用全屏（CGWindowList）→ 自动禁用桌宠交互；亦可托盘/快捷键手动切换 |
+| 自定义快捷键（1.0.3） | ✅ | 默认 F7=游戏模式 F8=切换屏幕 F9=显示/隐藏桌宠；设置页可改键（全局触发经 CGEventTap 匹配，录入时暂停） |
+| 登录窗口拖拽（1.0.3） | ✅ | 前端 startDragging（capabilities 已含权限） |
 
 ---
 
@@ -207,8 +210,10 @@ WuwaTappo-macos/
     ├── icons/                        # 应用图标（多尺寸）
     └── src/
         ├── main.rs                   # 可执行入口（main → lib::run，6 行）
-        ├── lib.rs                    # Tauri 应用主逻辑（1403 行）
-        └── input.rs                  # 全局输入监听模块（864 行）
+        ├── lib.rs                    # Tauri 应用主逻辑（窗口/命令/快捷键系统/登录补发）
+        ├── input.rs                  # 全局输入监听模块（CGEventTap + 快捷键触发匹配）
+        ├── fullscreen.rs             # 前台应用全屏检测（游戏模式数据源，CGWindowList FFI）
+        └── ws_proxy.rs               # 房间 socket.io 本地中继代理（Origin 白名单绕过）
 ```
 
 > **注意**：仓库不包含前端源代码（Vue/TS），仅包含编译后的 dist。若需重构建前端，需从官方 exe 逆向复现源码（不在本仓库覆盖范围内）。
@@ -310,16 +315,15 @@ adhoc 签名产物未公证，他人首次打开需 **右键 → 打开**（绕�
 
 ## 前端补丁清单
 
-官方 dist 除以下补丁外字节不动：
+官方 dist（当前基于 **1.0.3**）除以下补丁外字节不动：
 
 | 文件 | 补丁 | 原因 |
 |---|---|---|
-| `index.html` | `<head>` 注入 document.cookie shim（localStorage 后端） | WKWebView 在 `tauri://localhost` 自定义 scheme 下禁用 `document.cookie`（WebKit 非 http(s) origin 限制）；官方前端登录态存于 `kuro_infoToken` cookie，不禁用会导致"登录成功但应用仍显示未登录" |
-| `assets/index-D8GJxFG7.js` | 应用显示文案 | 应用名适配 |
-| | `isdkSrc` / `isdkCss` 由 `//pro-cdn-sdk.kurogame.com/...` 改为 `https://...` | protocol-relative URL 在 `tauri://localhost` 下解析失败 → KuroSDK 加载不了 → 登录窗口空白 |
-| `assets/index-DmC0wUEw.js` | `key-press` 监听注册后追加 `notify_input_bridge_ready()` 注入 | 输入桥就绪握手观测点（仅日志，不门控） |
-| | `Ig()` 默认 socket 地址由 `https://api-mc-wuwatappo.kurogames-global.com` 改为 `http://127.0.0.1:17321`（本地代理） | 房间 socket.io 服务端 Origin 白名单拒绝 `tauri://localhost`（403），代理外发时重写为官方值（见「房间 socket 代理」） |
-| `assets/index-DenkafYz.js` | 文案适配 | 同应用名适配 |
+| `index.html` | `<head>` 注入 document.cookie shim（localStorage 后端）；主 bundle/CSS 引用随版本更新 | WKWebView 在 `tauri://localhost` 自定义 scheme 下禁用 `document.cookie`（WebKit 非 http(s) origin 限制）；官方前端登录态存于 `kuro_infoToken` cookie，不打补丁会导致"登录成功但应用仍显示未登录" |
+| 全部 `assets/*.js` | 显示名 `"Wuwa Tappo"` → `"WuwaTappo"`（1.0.3 共 102 处） | 应用名统一（与产品名/托盘一致） |
+| `assets/index-CuzHFfJW.js`（主 bundle） | `isdkSrc` / `isdkCss` 由 `//pro-cdn-sdk.kurogame.com/...` 改为 `https://...` | protocol-relative URL 在 `tauri://localhost` 下解析失败 → KuroSDK 加载不了 → 登录窗口空白 |
+| `assets/index-pp8VWaUF.js`（房间/panel） | `key-press` 监听注册后追加 `__TAURI_INTERNALS__.invoke("notify_input_bridge_ready")` 注入 | 输入桥就绪握手观测点（仅日志，不门控） |
+| | `ey()`（1.0.1 名 `Ig()`）默认 socket 地址由 `https://api-mc-wuwatappo.kurogames-global.com` 改为 `http://127.0.0.1:17321`（本地代理） | 房间 socket.io 服务端 Origin 白名单拒绝 `tauri://localhost`（403），代理外发时重写为官方值（见「房间 socket 代理」） |
 
 ---
 
@@ -389,6 +393,8 @@ adhoc 签名产物未公证，他人首次打开需 **右键 → 打开**（绕�
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| 1.0.3-beta | 2026-11-02 | 跟随官方 1.0.3 前端：游戏模式（CGWindowList 全屏检测）、自定义快捷键（F7/F8/F9 可改键，全局触发 + 录入保护）、登录窗拖拽、新美术资源；4 项移植补丁全量平移 |
+| 1.0.1-beta | 2026-11-02 | 首个登录+联机全打通版本：cookie shim 登录态持久化、login-modal-open 补发与 intent 透传、NSWindow level 物理分层（桌宠恒置顶）、房间 socket.io 本地中继代理（Origin 白名单绕过）、auth 链防腰斩；发布版匿名化（路径重映射/诊断剥离） |
 | v0.0.1-Beta | 2026-10-28 | 首个开源版本：壳重建完成；修复 hit_region 字段解析（left/top）、KrSDK https 加载、计数持久化、WKWebView keep-alive、面板 1240×800 适配；修复退出时键盘重复刷屏（事件转发改为异步 channel） |
 
 ---

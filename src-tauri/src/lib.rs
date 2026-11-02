@@ -16,6 +16,7 @@ use tauri::{
 };
 use tauri_plugin_updater::UpdaterExt;
 
+mod fullscreen;
 mod input;
 mod ws_proxy;
 
@@ -590,9 +591,15 @@ fn set_main_window_monitor_bounds<R: Runtime>(
 #[tauri::command]
 fn get_main_desktop_safe_area() -> serde_json::Value {
     println!("[cmd] get_main_desktop_safe_area");
+    // 1.0.3 游戏模式数据源：前端 refreshDesktopMetrics 读取
+    // foregroundApplicationFullscreen（其他应用全屏 → autoGameModeOnFullscreen
+    // 自动进入游戏模式）。macOS 用 CGWindowList 检测全屏覆盖窗口。
+    let app_fullscreen = fullscreen::foreground_application_fullscreen();
     serde_json::json!({
         "insets": {"left": 0.0, "top": 0.0, "right": 0.0, "bottom": 0.0},
         "autoHideEdge": null,
+        "foregroundFullscreen": app_fullscreen,
+        "foregroundApplicationFullscreen": app_fullscreen,
     })
 }
 
@@ -1116,6 +1123,164 @@ pub struct InputBridgeReady(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
 /// 其余=国服展示登录浮层）。on_page_load 拿不到命令参数，经 State 中转。
 pub struct LoginIntent(pub Mutex<String>);
 
+// ---------------------------------------------------------------------------
+// 自定义快捷键系统（1.0.3 官方新增：get_app_shortcuts / set_app_shortcuts /
+// set_shortcut_capture；触发经 "app-shortcut" 事件、配置变更经
+// "app-shortcuts-changed" 广播）
+// ---------------------------------------------------------------------------
+
+/// 前端 binding 结构（main bundle DEFAULT_APP_SHORTCUTS）：
+/// modifiers 位编码 = Alt(Option):1 | Ctrl:2 | Shift:4 | Meta(Cmd):8；
+/// key = DOM keyCode（F1-F24 = 111+n，字母 = 大写 ASCII，数字 = 48-57）。
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ShortcutBinding {
+    pub modifiers: u32,
+    pub key: u32,
+}
+
+/// action 名 → 绑定。默认与官方一致：F7=gameMode F8=switchScreen F9=togglePet
+pub struct AppShortcuts(pub Mutex<std::collections::HashMap<String, ShortcutBinding>>);
+
+/// 设置面板录入按键期间为 true：暂停全局快捷键触发（前端 ShortcutInput
+/// 用 DOM keydown 捕获按键，Rust 侧若同时触发全局动作会互相干扰）
+pub struct ShortcutCapture(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+pub fn default_shortcuts() -> std::collections::HashMap<String, ShortcutBinding> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("gameMode".into(), ShortcutBinding { modifiers: 0, key: 118 });
+    m.insert("switchScreen".into(), ShortcutBinding { modifiers: 0, key: 119 });
+    m.insert("togglePet".into(), ShortcutBinding { modifiers: 0, key: 120 });
+    m
+}
+
+fn shortcuts_to_json(m: &std::collections::HashMap<String, ShortcutBinding>) -> serde_json::Value {
+    serde_json::Value::Object(
+        m.iter()
+            .map(|(k, v)| (k.clone(), serde_json::json!({ "modifiers": v.modifiers, "key": v.key })))
+            .collect(),
+    )
+}
+
+fn shortcuts_from_json(v: &serde_json::Value) -> std::collections::HashMap<String, ShortcutBinding> {
+    let mut m = std::collections::HashMap::new();
+    if let Some(obj) = v.as_object() {
+        for (k, b) in obj {
+            if let (Some(mods), Some(key)) = (
+                b.get("modifiers").and_then(|x| x.as_u64()),
+                b.get("key").and_then(|x| x.as_u64()),
+            ) {
+                m.insert(k.clone(), ShortcutBinding { modifiers: mods as u32, key: key as u32 });
+            }
+        }
+    }
+    m
+}
+
+#[tauri::command]
+fn get_app_shortcuts<R: Runtime>(app: AppHandle<R>) -> serde_json::Value {
+    println!("[cmd] get_app_shortcuts");
+    let map = {
+        let st = app.state::<AppShortcuts>();
+        let guard = st.0.lock().unwrap();
+        guard.clone()
+    };
+    shortcuts_to_json(&map)
+}
+
+#[tauri::command]
+fn set_app_shortcuts<R: Runtime>(app: AppHandle<R>, config: serde_json::Value) -> Result<serde_json::Value, String> {
+    dlog("[cmd] set_app_shortcuts");
+    let parsed = shortcuts_from_json(&config);
+    // duplicate 校验：两个不同 action 绑定了同一组合（key=0 为"未设置"，跳过）
+    let mut seen: std::collections::HashMap<(u32, u32), &String> = std::collections::HashMap::new();
+    for (action, b) in &parsed {
+        if b.key == 0 {
+            continue;
+        }
+        if seen.insert((b.modifiers, b.key), action).is_some() {
+            return Err("duplicate".into());
+        }
+    }
+    if let Some(st) = app.try_state::<AppShortcuts>() {
+        *st.0.lock().unwrap() = parsed.clone();
+    }
+    // 持久化（native-store/store.json 的 app_shortcuts 键）
+    let mut store = store_read(&app);
+    store["app_shortcuts"] = shortcuts_to_json(&parsed);
+    store_write(&app, &store);
+    // 广播给所有窗口（main 更新触发器、panel 设置页刷新显示）
+    let _ = app.emit("app-shortcuts-changed", shortcuts_to_json(&parsed));
+    Ok(shortcuts_to_json(&parsed))
+}
+
+#[tauri::command]
+fn set_shortcut_capture<R: Runtime>(app: AppHandle<R>, active: bool) -> Result<(), String> {
+    dlog(&format!("[cmd] set_shortcut_capture active={active}"));
+    if let Some(st) = app.try_state::<ShortcutCapture>() {
+        st.0.store(active, std::sync::atomic::Ordering::Release);
+    }
+    Ok(())
+}
+
+/// macOS virtual keycode（kVK_*）→ DOM keyCode（与前端 keyFromEvent 对齐）
+pub fn dom_key_from_cg(code: u16) -> Option<u32> {
+    Some(match code {
+        // F1-F12（kVK_F1=122, F2=120, F3=99, F4=118, F5=96, F6=97, F7=98,
+        // F8=100, F9=101, F10=109, F11=103, F12=111）→ DOM 112..123
+        122 => 112, 120 => 113, 99 => 114, 118 => 115, 96 => 116, 97 => 117,
+        98 => 118, 100 => 119, 101 => 120, 109 => 121, 103 => 122, 111 => 123,
+        // 字母（kVK_ANSI_*）→ 大写 ASCII
+        0 => 65, 11 => 66, 8 => 67, 2 => 68, 14 => 69, 3 => 70, 5 => 71, 4 => 72,
+        34 => 73, 38 => 74, 40 => 75, 37 => 76, 46 => 77, 45 => 78, 31 => 79,
+        35 => 80, 12 => 81, 15 => 82, 1 => 83, 17 => 84, 32 => 85, 9 => 86,
+        13 => 87, 7 => 88, 16 => 89, 6 => 90,
+        // 数字主排（kVK_ANSI_1=18 ... 0=29）→ 48..57
+        18 => 49, 19 => 50, 20 => 51, 21 => 52, 23 => 53,
+        22 => 54, 26 => 55, 28 => 56, 25 => 57, 29 => 48,
+        // 常用命名键
+        49 => 32,          // Space
+        123 => 37, 124 => 39, 125 => 40, 126 => 38, // ←→↓↑
+        116 => 33, 121 => 34, 119 => 35, 115 => 36, // PageUp/Down End Home
+        _ => return None,
+    })
+}
+
+/// CGEventFlags → 前端 eventModifiers 位编码（Alt:1 Ctrl:2 Shift:4 Meta:8）
+pub fn dom_mods_from_cg(flags: u64) -> u32 {
+    const ALT: u64 = 0x0008_0000; // kCGEventFlagMaskAlternate
+    const CTRL: u64 = 0x0004_0000; // kCGEventFlagMaskControl
+    const SHIFT: u64 = 0x0002_0000; // kCGEventFlagMaskShift
+    const CMD: u64 = 0x0010_0000; // kCGEventFlagMaskCommand
+    (if flags & ALT != 0 { 1 } else { 0 })
+        | (if flags & CTRL != 0 { 2 } else { 0 })
+        | (if flags & SHIFT != 0 { 4 } else { 0 })
+        | (if flags & CMD != 0 { 8 } else { 0 })
+}
+
+/// 全局按键 → 已配置快捷键 action 匹配（input.rs emitter 线程调用；
+/// tap 回调禁止加锁，匹配只能在 emitter 侧做）。capture 模式暂停匹配。
+pub fn match_shortcut<R: Runtime>(app: &AppHandle<R>, code: u16, flags: u64) -> Option<String> {
+    if let Some(cap) = app.try_state::<ShortcutCapture>() {
+        if cap.0.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+    }
+    let key = dom_key_from_cg(code)?;
+    let mods = dom_mods_from_cg(flags);
+    // 与前端 shortcutFromEvent 相同约束：非 F 键（<112）必须带 Ctrl/Alt/Meta
+    if key < 112 && mods & 11 == 0 {
+        return None;
+    }
+    let st = app.try_state::<AppShortcuts>()?;
+    let map = st.0.lock().unwrap();
+    for (action, b) in map.iter() {
+        if b.key == key && b.modifiers == mods {
+            return Some(action.clone());
+        }
+    }
+    None
+}
+
 #[tauri::command]
 fn notify_input_bridge_ready<R: Runtime>(app: AppHandle<R>) {
     dlog("[cmd] notify_input_bridge_ready");
@@ -1286,6 +1451,16 @@ pub fn run() {
                 std::sync::atomic::AtomicBool::new(false),
             )));
             app.manage(LoginIntent(Mutex::new("login".into())));
+            // 快捷键配置：store.json 有存档用存档，否则官方默认（F7/F8/F9）
+            let saved = store_read(app.handle()).get("app_shortcuts").cloned();
+            let shortcuts = saved
+                .map(|v| shortcuts_from_json(&v))
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(default_shortcuts);
+            app.manage(AppShortcuts(Mutex::new(shortcuts)));
+            app.manage(ShortcutCapture(std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            )));
 
             // 房间 socket.io 本地中继代理：服务端 Origin 白名单拒绝
             // tauri://localhost（403），代理外发时重写为官方 Windows 值
@@ -1497,6 +1672,10 @@ pub fn run() {
             set_panel_window_collapsed,
             open_login_window,
             close_login_window,
+            // 自定义快捷键（1.0.3）
+            get_app_shortcuts,
+            set_app_shortcuts,
+            set_shortcut_capture,
             resize_login_window_to_content,
             open_update_window,
             close_update_window,

@@ -1,6 +1,6 @@
 [package]
 name = "wuwatappo-macos"
-version = "1.0.1-beta"
+version = "1.0.3-beta"
 description = "Wuwa Tappo (鸣潮桌宠) macOS port"
 authors = ["port"]
 edition = "2021"

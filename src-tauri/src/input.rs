@@ -334,7 +334,9 @@ fn listen_event_granted() -> bool {
 /// 触发键盘重复——表现为按 Cmd+Q 退出时字符疯狂刷屏（用户实测必现）。
 /// 之前回调里直接 emit_to / dlog 写盘 / 查 state 都可能阻塞，必须全部移出。
 enum TapMsg {
-    Key(&'static str, bool),
+    /// (键名, 按下?, CGKeyCode, CGEventFlags 原始位) —— keycode/flags 供
+    /// emitter 线程做全局快捷键匹配（tap 回调禁止加锁，匹配只能后置）
+    Key(&'static str, bool, u16, u64),
     Move(f64, f64),
     Button(bool, bool),
     Hover(bool),
@@ -369,7 +371,17 @@ fn spawn_emitter(app: AppHandle, rx: std::sync::mpsc::Receiver<TapMsg>) {
         .spawn(move || {
             while let Ok(msg) = rx.recv() {
                 match msg {
-                    TapMsg::Key(key, pressed) => {
+                    TapMsg::Key(key, pressed, code, flags) => {
+                        // 全局快捷键（1.0.3）：按下时先匹配快捷键表，命中则
+                        // emit app-shortcut 给 main（前端执行 gameMode/
+                        // switchScreen/togglePet），且不再发 key-press——
+                        // 快捷键不应计入打字计数。
+                        if pressed {
+                            if let Some(action) = crate::match_shortcut(&app, code, flags) {
+                                let _ = app.emit_to("main", "app-shortcut", action);
+                                continue;
+                            }
+                        }
                         let name = if pressed { "key-press" } else { "key-release" };
                         let _ = app.emit_to("main", name, key);
                     }
@@ -445,9 +457,9 @@ fn update_pointer_mode(ctx: &TapContext, gx: f64, gy: f64) {
     }
 }
 
-/// 按键 → 入队（回调里绝不直接 emit）
-fn emit_key(ctx: &TapContext, key: &'static str, pressed: bool) {
-    let _ = ctx.tx.try_send(TapMsg::Key(key, pressed));
+/// 按键 → 入队（回调里绝不直接 emit；code/flags 供 emitter 快捷键匹配）
+fn emit_key(ctx: &TapContext, key: &'static str, pressed: bool, code: u16, flags: u64) {
+    let _ = ctx.tx.try_send(TapMsg::Key(key, pressed, code, flags));
 }
 
 fn key_code(event: &CGEvent) -> u16 {
@@ -514,13 +526,13 @@ fn handle_flags_changed(ctx: &TapContext, code: u16, flags: u64) {
         0x36 | 0x37 => ("Meta", MASK_COMMAND),
         0x39 => {
             // CapsLock 为开关型：发一对 press+release，避免前端按住集合残留
-            emit_key(ctx, "CapsLock", true);
-            emit_key(ctx, "CapsLock", false);
+            emit_key(ctx, "CapsLock", true, code, flags);
+            emit_key(ctx, "CapsLock", false, code, flags);
             return;
         }
         _ => return,
     };
-    emit_key(ctx, key, flags & mask != 0);
+    emit_key(ctx, key, flags & mask != 0, code, flags);
 }
 
 /// 鼠标按下/释放 → 入队（回调里绝不直接 emit）
@@ -562,7 +574,9 @@ unsafe extern "C-unwind" fn event_tap_callback(
             }
             match map_key_code(code) {
                 Some(key) => {
-                    emit_key(ctx, key, pressed);
+                    // flags 仅在按下时提取（快捷键匹配只用 press 沿）
+                    let flags = if pressed { CGEvent::flags(Some(event_ref)).bits() } else { 0 };
+                    emit_key(ctx, key, pressed, code, flags);
                 }
                 None => {
                     // 未映射键只累加计数，不写盘（写盘会拖慢回调导致事件丢失）
@@ -827,7 +841,7 @@ fn run_worker(app: AppHandle) {
                     for code in 0..64u16 {
                         if bits & (1u64 << code) != 0 {
                             if let Some(k) = map_key_code(code) {
-                                let _ = ctx.tx.try_send(TapMsg::Key(k, false));
+                                let _ = ctx.tx.try_send(TapMsg::Key(k, false, code, 0));
                                 released += 1;
                             }
                         }
