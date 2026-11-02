@@ -95,9 +95,10 @@ async fn handle_conn(client: TcpStream, peer: std::net::SocketAddr) {
             return;
         }
     };
+    // 日志脱敏：path_query 携带 infoToken 凭据，只记录 path 部分
+    let path_only = path_query.split('?').next().unwrap_or("/socket.io/");
     crate::dlog(&format!(
-        "[ws-proxy] relay established: {peer} -> {TARGET_HOST}{} (upstream {})",
-        path_query,
+        "[ws-proxy] relay established: {peer} -> {TARGET_HOST}{path_only} (upstream {})",
         resp.status()
     ));
 

@@ -1,6 +1,6 @@
 [package]
 name = "wuwatappo-macos"
-version = "1.0.1"
+version = "1.0.1-beta"
 description = "Wuwa Tappo (鸣潮桌宠) macOS port"
 authors = ["port"]
 edition = "2021"
@@ -43,3 +43,6 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+# 发布匿名化：编译机绝对路径（/Users/<name>/...）经构建脚本 RUSTFLAGS
+# -C remap-path-prefix 重映射为虚拟前缀（见 .cargo/config.toml），
+# 避免分发二进制泄露打包者用户名/目录结构
