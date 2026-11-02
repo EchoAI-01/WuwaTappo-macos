@@ -4,7 +4,7 @@
 > 仓库版本：v0.0.1-Beta | Tauri 2.10.3 | Rust Edition 2021  
 > 官方前端资产版本：1.0.1（`Cargo.toml`/`tauri.conf.json` 中的版本号沿袭官方 exe 资产，便于对应官方功能集）  
 > 仓库：https://github.com/EchoAI-01/WuwaTappo-macos  
-> 文档更新：2026-10-29（同步 input.rs 双模式 tap / 通道化回调 / 几何缓存 / 固定签名等改动）
+> 文档更新：2026-11-02（全量代码 Review 同步：行号快照刷新至 lib.rs 1403 行 / input.rs 864 行；新增 §11 三大 BUG 现场诊断与修复路线；记录 login 红底临时诊断代码与签名/产物现状）
 
 ---
 
@@ -34,6 +34,7 @@
   - [9.4 已知限制](#94-已知限制)
   - [9.5 源码中的 no-op 命令](#95-源码中的-no-op-命令)
 - [10. 事件协议参考](#10-事件协议参考)
+- [11. 当前 BUG 现场诊断与修复路线（2026-11-02）](#11-当前-bug-现场诊断与修复路线2026-11-02)
 
 ---
 
@@ -303,8 +304,8 @@ WuwaTappo-macos/
     │
     └── src/                        # Rust 源码
         ├── main.rs                 # 可执行入口（main → lib::run）
-        ├── lib.rs                  # Tauri 应用主逻辑（1334 行）
-        └── input.rs                # 全局输入监听模块（539 行）
+        ├── lib.rs                  # Tauri 应用主逻辑（1403 行）
+        └── input.rs                # 全局输入监听模块（864 行）
 ```
 
 ---
@@ -316,7 +317,7 @@ WuwaTappo-macos/
 #### 文件位置
 
 - [main.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/main.rs) (6 行)
-- [lib.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/lib.rs) (1334 行)
+- [lib.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/lib.rs) (1403 行)
 
 #### 启动流程
 
@@ -492,6 +493,8 @@ input-emitter 线程（独立）
 
 > **关键架构**：main 窗口是 **全屏透明 shell**（覆盖整个屏幕），`ignoresMouseEvents` 恒穿透。桌宠本体绘制在右下角 CSS 区域（绝对定位）。所有辅助窗口不穿透，正常接收点击。全部窗口共用同一个 `index.html`，靠 hash 路由区分页面。
 
+> **⚠️ 临时诊断代码（e5e6375）**：`open_login_window`（lib.rs L800）在创建 login 窗口后会注入**红色背景**（`document.documentElement/body background #ff0000`），用于区分"窗口不存在"与"内容未渲染"两种登录不可见情形。**这是 BUG 1 的诊断脚手架，根因确认后必须移除**，否则正常登录界面会带红底。详见 §11。
+
 #### 交互管线（本移植的核心）
 
 官方 Windows 版用 Win32 per-region 命中测试（`WM_NCHITTEST`）实现"桌宠可点、空白处穿透"。macOS 没有 per-region 窗口级命中测试，因此按权限分两条路径：
@@ -650,7 +653,7 @@ app.emit("tray-set-pet-scale", 125.0)
 
 ### 4.5 前端-后端命令桥（Invoke Handlers）
 
-项目共注册 **40+ 自定义 Tauri 命令**，按功能分组：
+项目共注册 **50 个自定义 Tauri 命令**（与官方 exe 逆向清单 1:1），按功能分组：
 
 #### 更新与遥测（7 个）
 
@@ -778,10 +781,10 @@ app.emit("tray-set-pet-scale", 125.0)
 
 | 类型 | 位置 (行号) | 说明 |
 |------|------------|------|
-| `MenuLabels` | L27-57 | 多语言托盘文案结构体（14 个字段，带 serde default） |
-| `TrayState` | L73-80 | 托盘运行时状态 |
+| `MenuLabels` | L28-57 | 多语言托盘文案结构体（14 个字段，带 serde default） |
+| `TrayState` | L74-80 | 托盘运行时状态 |
 | `SharedTrayState` | L81 | 托盘状态托管（Mutex<TrayState>） |
-| `InputBridgeReady` | L978 | 输入桥就绪标志（Arc<AtomicBool>） |
+| `InputBridgeReady` | L1040 | 输入桥就绪标志（Arc<AtomicBool>） |
 
 ### 5.2 input.rs 核心类型
 
@@ -837,7 +840,7 @@ app.emit("tray-set-pet-scale", 125.0)
 
 ### 5.4 lib.rs 命令处理器完整清单
 
-> 共 50 个命令，按官方签名 1:1 重建。行号为编写时快照，改动后以函数名为准。
+> 共 50 个命令，按官方签名 1:1 重建。行号为 2026-11-02 快照（含 e5e6375 login 诊断代码后的 lib.rs 1403 行版本），改动后以函数名为准。
 
 | # | 命令函数 | 行号 | 返回类型 | 分类 |
 |---|---------|------|----------|------|
@@ -849,48 +852,48 @@ app.emit("tray-set-pet-scale", 125.0)
 | 6 | `sync_native_menu` | L188 | `()` | 托盘 |
 | 7 | `write_app_log` | L212 | `Result<(), String>` | 日志 |
 | 8 | `set_main_hit_region` | L294 | `Result<(), String>` | 命中区域 |
-| 9 | `set_main_force_cursor_ignore` | L327 | `Result<(), String>` | 穿透 |
-| 10 | `set_main_swallow_mouse` | L337 | `()` | Win32 no-op |
-| 11 | `set_main_skip_taskbar` | L344 | `Result<(), String>` | Dock |
-| 12 | `set_main_window_content_bounds` | L354 | `Result<(), String>` | 窗口尺寸 |
-| 13 | `set_overlay_cursor` | L391 | `()` | Win32 no-op |
-| 14 | `sync_main_window_to_current_monitor` | L398 | `Result<(), String>` | 显示器同步 |
-| 15 | `popup_main_dock_context_menu` | L430 | `Result<(), String>` | 右键菜单 |
-| 16 | `get_boot_diagnostics` | L453 | `Value` | 诊断 |
-| 17 | `is_devtools_hotkeys_build` | L471 | `bool` | 构建标记 |
-| 18 | `is_internal_testing_build` | L478 | `bool` | 构建标记 |
-| 19 | `apply_main_window_position` | L489 | `Result<(), String>` | 窗口位置 |
-| 20 | `set_main_window_fullscreen_shell` | L526 | `Result<(), String>` | Win32 only |
-| 21 | `set_main_window_monitor_bounds` | L533 | `Result<(), String>` | 显示器切换 |
-| 22 | `get_main_desktop_safe_area` | L559 | `Value` | 安全区 |
-| 23 | `get_main_taskbar_insets` | L569 | `Value` | 任务栏 |
-| 24 | `finish_main_window_monitor_switch` | L576 | `()` | no-op |
-| 25 | `sync_aux_windows_to_main_monitor` | L583 | `()` | 辅助窗口 |
-| 26 | `get_app_update_detail` | L605 | `Option<Value>` | 更新详情 |
-| 27 | `get_maintenance_notice_payload` | L612 | `Option<Value>` | 公告 |
-| 28 | `has_maintenance_notice` | L619 | `bool` | 公告状态 |
-| 29 | `hide_main_after_maintenance_notice_ready` | L626 | `()` | 公告后隐藏 |
-| 30 | `open_panel_window` | L701 | `Result<(), String>` | 面板 |
-| 31 | `close_panel_window` | L720 | `()` | 面板 |
-| 32 | `raise_panel_window_above_pets` | L729 | `()` | 面板层级 |
-| 33 | `set_panel_window_collapsed` | L739 | `Result<(), String>` | 面板折叠 |
-| 34 | `open_login_window` | L754 | `Result<(), String>` | 登录 |
-| 35 | `close_login_window` | L766 | `()` | 登录 |
-| 36 | `resize_login_window_to_content` | L774 | `Result<(), String>` | 登录尺寸 |
-| 37 | `open_update_window` | L789 | `Result<(), String>` | 更新窗口 |
-| 38 | `close_update_window` | L804 | `()` | 更新窗口 |
-| 39 | `open_about_window` | L812 | `Result<(), String>` | 关于 |
-| 40 | `close_about_window` | L819 | `()` | 关于 |
-| 41 | `open_oss_notice_window` | L827 | `Result<(), String>` | OSS |
-| 42 | `close_oss_notice_window` | L834 | `()` | OSS |
-| 43 | `is_elevated_autostart_enabled` | L846 | `Result<bool, String>` | 自启动 |
-| 44 | `set_elevated_autostart` | L855 | `Result<(), String>` | 自启动 |
-| 45 | `load_key_press_count` | L901 | `i64` | 打字计数 |
-| 46 | `save_key_press_count` | L922 | `()` | 打字计数 |
-| 47 | `load_cumulative_click_count` | L934 | `Value` | 累计点击 |
-| 48 | `save_cumulative_click_count` | L959 | `()` | 累计点击 |
-| 49 | `notify_input_bridge_ready` | L981 | `()` | 握手 |
-| 50 | `exit_app` | L992 | `()` | 退出 |
+| 9 | `set_main_force_cursor_ignore` | L330 | `Result<(), String>` | 穿透 |
+| 10 | `set_main_swallow_mouse` | L352 | `()` | Win32 no-op |
+| 11 | `set_main_skip_taskbar` | L359 | `Result<(), String>` | Dock |
+| 12 | `set_main_window_content_bounds` | L369 | `Result<(), String>` | 窗口尺寸 |
+| 13 | `set_overlay_cursor` | L407 | `()` | Win32 no-op |
+| 14 | `sync_main_window_to_current_monitor` | L414 | `Result<(), String>` | 显示器同步 |
+| 15 | `popup_main_dock_context_menu` | L447 | `Result<(), String>` | 右键菜单 |
+| 16 | `get_boot_diagnostics` | L470 | `Value` | 诊断 |
+| 17 | `is_devtools_hotkeys_build` | L488 | `bool` | 构建标记 |
+| 18 | `is_internal_testing_build` | L495 | `bool` | 构建标记 |
+| 19 | `apply_main_window_position` | L506 | `Result<(), String>` | 窗口位置 |
+| 20 | `set_main_window_fullscreen_shell` | L543 | `Result<(), String>` | Win32 only |
+| 21 | `set_main_window_monitor_bounds` | L550 | `Result<(), String>` | 显示器切换 |
+| 22 | `get_main_desktop_safe_area` | L576 | `Value` | 安全区 |
+| 23 | `get_main_taskbar_insets` | L586 | `Value` | 任务栏 |
+| 24 | `finish_main_window_monitor_switch` | L593 | `()` | no-op |
+| 25 | `sync_aux_windows_to_main_monitor` | L600 | `()` | 辅助窗口 |
+| 26 | `get_app_update_detail` | L622 | `Option<Value>` | 更新详情 |
+| 27 | `get_maintenance_notice_payload` | L629 | `Option<Value>` | 公告 |
+| 28 | `has_maintenance_notice` | L636 | `bool` | 公告状态 |
+| 29 | `hide_main_after_maintenance_notice_ready` | L643 | `()` | 公告后隐藏 |
+| 30 | `open_panel_window` | L746 | `Result<(), String>` | 面板 |
+| 31 | `close_panel_window` | L765 | `()` | 面板 |
+| 32 | `raise_panel_window_above_pets` | L775 | `()` | 面板层级 |
+| 33 | `set_panel_window_collapsed` | L785 | `Result<(), String>` | 面板折叠 |
+| 34 | `open_login_window` | L800 | `Result<(), String>` | 登录 |
+| 35 | `close_login_window` | L824 | `()` | 登录 |
+| 36 | `resize_login_window_to_content` | L833 | `Result<(), String>` | 登录尺寸 |
+| 37 | `open_update_window` | L848 | `Result<(), String>` | 更新窗口 |
+| 38 | `close_update_window` | L863 | `()` | 更新窗口 |
+| 39 | `open_about_window` | L872 | `Result<(), String>` | 关于 |
+| 40 | `close_about_window` | L879 | `()` | 关于 |
+| 41 | `open_oss_notice_window` | L888 | `Result<(), String>` | OSS |
+| 42 | `close_oss_notice_window` | L895 | `()` | OSS |
+| 43 | `is_elevated_autostart_enabled` | L908 | `Result<bool, String>` | 自启动 |
+| 44 | `set_elevated_autostart` | L917 | `Result<(), String>` | 自启动 |
+| 45 | `load_key_press_count` | L963 | `i64` | 打字计数 |
+| 46 | `save_key_press_count` | L984 | `()` | 打字计数 |
+| 47 | `load_cumulative_click_count` | L996 | `Value` | 累计点击 |
+| 48 | `save_cumulative_click_count` | L1021 | `()` | 累计点击 |
+| 49 | `notify_input_bridge_ready` | L1043 | `()` | 握手 |
+| 50 | `exit_app` | L1054 | `()` | 退出 |
 
 ---
 
@@ -1359,6 +1362,99 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
 
 ---
 
+## 11. 当前 BUG 现场诊断与修复路线（2026-11-02）
+
+> 本章基于全量代码 Review + 运行时日志现场证据（`/tmp/wuwatappo-input.log`、`/tmp/wuwatappo-diag.log`、`~/Library/Application Support/com.kuro.wuwatappo.cn/logs/app-*.log`）整理，是后续修复工作的作战地图。
+
+### 11.0 现场证据摘要
+
+| 证据 | 来源 | 结论 |
+|------|------|------|
+| `tap mode = listen-only（缺「输入监控」权限）` | `/tmp/wuwatappo-input.log`（10-29 19:32 运行） | **CGEventTap 处于降级模式**：收不到全局键盘、无法吞鼠标事件 |
+| `parsed: 3 visual, 3 input regions` → 稳态 `0in/3vis` | `/tmp/wuwatappo-diag.log` | hit_region 解析正常（left/top 兼容生效）；稳态 inputRegions 为空是前端 `updateNativeInput:false` 的正常行为，visual 3 区域仍可命中 |
+| `bridge_ready=true`，main 2560×1440 全屏 shell | `/tmp/wuwatappo-diag.log` | 前端初始化链完整跑通（含 `notify_input_bridge_ready` 握手） |
+| `diag installed #/login` 同秒 `onerror: Script error.`，随后 `onerror: ? @:0` 刷屏 **2266 次** | `app-20261028.log`（本地 10:52） | **login 窗口加载 KrSDK 后立即抛跨域脚本错误**，且错误反复触发；跨域脚本无 CORS 属性时浏览器屏蔽错误详情（`Script error.`） |
+| 双显示器：主屏 2560×1440 scale=1，副屏 3420×2224 scale=2 bounds(816,2880) | `app-20261029.log` boot | 多屏环境存在 scale 混算风险面（`to_physical` / 前端 `Ht()`） |
+| `logged_in=false` | `app-20261029.log` boot | 截至最后一次运行从未登录成功 |
+| app 产物 10-28 19:31 构建，`Signature size=1649`（WuwaTappo Dev Signing 固定证书）；**dmg 仍是 10-27 adhoc 旧版** | `codesign -dv` + bundle 目录 | .app 已含全部修复+红底诊断；dmg 过期，修复完成后必须重新打包 |
+
+### 11.1 BUG 1：点击"登录/联机"→ 面板消失、无后续
+
+**官方链路（正常行为部分）**：panel 内点登录 → 前端 `close_panel_window`（面板消失是**官方设计**）→ `open_login_window`（modalWindows chunk）→ Rust 建 520×440 透明无边框 login 窗口 → login 页动态加载 KrSDK（`kr-sdk.js`）→ `KrSDK.core.openLoginView()` 弹登录浮层。"加入房间"需登录态，未登录时走同一链路。
+
+**故障点**：login 窗口创建了，但用户什么都看不见。日志实锤 `#/login` 加载同秒即抛 `Script error.` 并持续刷屏，说明 **KrSDK 跨域脚本在 `tauri://localhost` 环境下执行报错**，登录浮层未能渲染；透明窗口 + 无内容 = 整窗不可见。
+
+**已排除**：isdkSrc/isdkCss 已是 `https://` 绝对地址（补丁生效）；`sync_main_layer` 已保证 login 不被 main 盖住；窗口尺寸已适配 500×378 卡片。
+
+**待验证假设（按优先级）**：
+1. **KrSDK 脚本对运行环境的兼容问题**：SDK 可能依赖 cookie/同源 XHR/`document.domain`，在 `tauri://localhost` 自定义协议下第三方 cookie 或 XHR 被 WKWebView 拦截。`Script error.` 无详情，需先让错误可见。
+2. **错误详情不可见是诊断障碍**：script 标签无 `crossorigin="anonymous"`，跨域错误被浏览器脱敏。若 `pro-cdn-sdk.kurogame.com` 返回 CORS 头，给动态 script 加 `crossorigin` 即可拿到真实堆栈。
+3. **红底诊断（e5e6375）尚未跑过**：10-29 运行未点登录。先跑一次红底版确认"窗口在但内容空白" vs "窗口根本不在"。
+
+**修复路线**：
+```
+① open 启动红底诊断版 → 点登录 → 截图：红底可见=窗口在、内容未渲染（进入②）；无红底=窗口创建/层级问题（查 sync_main_layer/create_aux_window）
+② 给 KrSDK script 注入 crossorigin="anonymous"（前端 patch 或 Rust on_page_load eval）→ 复现 → 从 app log 读真实错误堆栈
+③ 按堆栈定位：CSP/cookie/XHR/域名白名单 → 对症处理（tauri.conf.json csp 当前为 null 不拦截；重点是 WKWebView 第三方存储分区 ITP 对 SDK cookie 的影响）
+④ 备选：将 kr-sdk.js/style.css 本地化进 dist（同源加载，消除跨域与 ITP 问题；需验证 SDK 是否有同源检测）
+⑤ 根因修复后移除红底诊断代码
+```
+
+### 11.2 BUG 2：应用未聚焦时键盘不计数
+
+**根因已锁定（非代码 bug，是权限态）**：`tap mode = listen-only`。macOS 10.15+ 的 TCC 将「监听键盘」归入**输入监控（Input Monitoring / kTCCServiceListenEvent）**权限；仅有「辅助功能」时 ListenOnly tap 收不到 KeyDown/KeyUp。窗口聚焦时计数走 WKWebView 原生 keydown，所以"聚焦正常、失焦失效"。
+
+**代码已具备的能力**：启动时 `CGPreflightListenEventAccess` 检测 → 未授权自动打开系统设置「输入监控」面板 + `CGRequestListenEventAccess()` 弹系统授权框 → ListenOnly 运行期间每 2s 轮询，授权后**热升级重建 Default tap**（无需重启）。
+
+**为什么用户仍处于 listen-only**：10-29 运行日志显示权限仍未授予——可能用户未在系统设置勾选「输入监控」（弹窗易被忽略），或此前 adhoc 签名时代授权已失效（现已换固定证书，重新授权一次即可持久）。
+
+**修复路线**：
+```
+① 系统设置 → 隐私与安全性 → 输入监控 → 勾选 WuwaTappo（固定证书签名后授权跨编译保持）
+② 验证 /tmp/wuwatappo-input.log 变为 "tap mode = default/swallow"
+③ 产品化改进（可选）：listen-only 时前端弹 toast 明确提示"需要输入监控权限"，而非静默降级——当前只有 /tmp 日志和一闪而过的系统设置窗口，用户几乎必然忽略
+```
+
+### 11.3 BUG 3：桌宠拖动/点击互动时常失效
+
+**与 BUG 2 同根（listen-only 降级模式），叠加降级路径自身的时序缺陷**：
+
+1. **点击穿透**：ListenOnly 无法吞事件（回调返回 null 仅在 Default 模式有效），点击桌宠的事件会同时落到桌面（框选图标/激活下层窗口）。
+2. **hover 动态穿透竞态**：降级路径靠 `apply_pointer_hover` 在指针进入桌宠区域时把 main 窗口切为"接收鼠标"。该链路是 tap 线程 → channel → emitter 线程 → `run_on_main_thread` → 主线程 set_ignore_cursor_events，**多跳异步**；快速移动/立即点击时切换未生效，点击漏到桌面。且窗口切换接收后，WKWebView 原生 DOM 事件与前端合成事件可能打架（Default 模式注释明确提到此冲突，ListenOnly 的 hover 路径同样暴露）。
+3. **regions 稳态 0in/3vis**：hit_test 是 `input || visual` 判定，visual 3 区域（桌宠身体 212×223 + 两个按钮 74×56）仍可命中，**不是失效主因**；但拖拽中前端若重算区域并经 100ms 节流的 `refresh_main_geom` 同步，几何缓存可能滞后一拍，拖出区域边界后判定翻脸（"时常失效"的间歇性来源之一）。
+4. **双屏 scale 风险**：主屏 scale=1 时 `to_physical` 无误差；若桌宠拖到副屏（scale=2），CG 逻辑点 × 副屏 scale 与前端 `Ht()` 的 `innerPosition/scaleFactor` 换算是否一致未实测。
+
+**修复路线**：
+```
+① 先解决权限（同 11.2）→ Default tap 模式吞事件，点击不再穿透，hover 竞态路径自动停用（active_default=true 时 update_pointer_mode 直接 return）
+② Default 模式下复测拖拽/点击/右键菜单/宝箱，确认剩余问题
+③ 若仍有间歇失效：排查拖拽中 hit_region 上报频率 vs refresh_main_geom 100ms 节流的滞后；必要时对拖拽会话（press 命中后）保持 hit 状态直到 release，不随区域变化中途翻脸
+④ 双屏拖拽专项测试（副屏 scale=2 坐标换算）
+```
+
+### 11.4 修复优先级与依赖
+
+```
+P0  输入监控授权（用户操作，1 分钟）──────► 同时解掉 BUG 2 全部 + BUG 3 大半
+P0  红底诊断跑一次（复现 BUG 1 现场）────► 分流"窗口不在" vs "内容不渲染"
+P1  KrSDK Script error. 详情获取（crossorigin 注入）► 定位 BUG 1 根因
+P1  BUG 1 根因修复 + 移除红底诊断
+P2  BUG 3 残余（拖拽时序/双屏）复测与修复
+P2  listen-only 用户可见提示（toast/托盘菜单警示）
+P3  重新打包 dmg（当前 bundle 内 dmg 是 10-27 adhoc 旧版）+ 固定证书签名 + README 功能状态表更新
+```
+
+### 11.5 构建产物与签名现状（2026-11-02 快照）
+
+| 产物 | 时间 | 签名 | 状态 |
+|------|------|------|------|
+| `target/release/bundle/macos/WuwaTappo.app` | 10-28 19:31 | **WuwaTappo Dev Signing**（size=1649，含 hardened runtime） | 最新：含全部已合入修复 + login 红底诊断 |
+| `target/release/bundle/dmg/WuwaTappo_1.0.1_aarch64.dmg` | 10-27 19:29 | adhoc（旧） | **过期**，勿分发；修复完成后重打 |
+
+> 注：`tauri.conf.json` 中 `signingIdentity` 仍为 `"-"`（adhoc），固定证书通过构建时环境变量注入：`APPLE_SIGNING_IDENTITY="WuwaTappo Dev Signing" cargo tauri build`。仓库配置保持 `"-"` 是为了其他开发者克隆后无证书也能构建（代价：他们需每次重新授权 TCC，见踩坑 §5）。
+
+---
+
 ## 附录 A：版本历史
 
 | 版本 | 日期 | 内容 |
@@ -1407,5 +1503,5 @@ cat ~/Library/Application\ Support/com.kuro.wuwatappo.cn/native-store/store.json
 
 ---
 
-*文档生成日期：2026-10-28 | 基于 lib.rs 1334 行 + input.rs 539 行源码分析*  
+*文档生成日期：2026-10-28 | 最近全量 Review：2026-11-02（基于 lib.rs 1403 行 + input.rs 864 行源码逐行核对）*  
 *同步自 README.md v0.0.1-Beta（2026-10-28 更新）*
