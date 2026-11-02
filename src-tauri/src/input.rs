@@ -712,9 +712,13 @@ fn run_worker(app: AppHandle) {
         let _ = unsafe { CGRequestListenEventAccess() };
     }
     for attempt in 1..=max_attempts {
-        // 有输入监控权限时才可能创建 Default（可吞事件）tap；
-        // 否则先试 ListenOnly（只观测，点击会穿透），避免每轮空等。
-        let can_swallow = listen_event_granted();
+        // Default（可吞事件）tap 需要双权限：输入监控（ListenEvent）+ 辅助功能（AX）。
+        // 实测（macOS 26）：仅 ListenEvent 时 Default tap_create 返回 null，
+        // 只能 ListenOnly。若只按 ListenEvent 判断，会在"ListenEvent 已授权但
+        // AX 未授权"状态下陷入死循环：轮询立即 break → 重建 Default 失败 →
+        // 回退 ListenOnly → 轮询又立即 break……每 ~2s 重建一次 tap，
+        // 重建窗口期事件丢失（拖拽/点击"时常失效"的一个来源）。
+        let can_swallow = listen_event_granted() && unsafe { AXIsProcessTrusted() };
         let mut active_tap = can_swallow;
         let mut tap = if can_swallow {
             unsafe {
@@ -751,20 +755,28 @@ fn run_worker(app: AppHandle) {
             tap_created_this_session = true;
             ctx.active_default.store(active_tap, Ordering::Release);
             let tap = t;
+            // listen-only 的真实原因按权限组合区分（文案曾误导：把"缺辅助功能"
+            // 也写成"缺输入监控"，用户对着错误面板反复授权无效）
+            let mode_line = if active_tap {
+                "default/swallow（输入监控+辅助功能已授权 → 桌宠区域点击不穿透、全局键盘可收）".to_string()
+            } else {
+                let (listen_ok, ax_ok) = (listen_event_granted(), unsafe { AXIsProcessTrusted() });
+                let reason = match (listen_ok, ax_ok) {
+                    (true, false) => "缺「辅助功能」→ 无法吞事件：点击会穿透到桌面（键盘/鼠标观测已正常）",
+                    (false, true) => "缺「输入监控」→ 键盘收不到、点击穿透",
+                    (false, false) => "缺「输入监控」+「辅助功能」→ 键盘收不到、点击穿透",
+                    (true, true) => "双权限齐备但 Default tap 被系统拒绝（异常，请反馈诊断日志）",
+                };
+                format!(
+                    "listen-only（{reason}）\n\
+                     → 若系统设置已勾选仍显示本行：\n\
+                     1) 核对下方 binary 路径与设置列表条目是否同一 app（旧签名/旧路径条目无效，删除后重加）\n\
+                     2) 完全退出并重启本 app（TCC 不刷新运行中进程的授权）"
+                )
+            };
             let _ = std::fs::write(
                 "/tmp/wuwatappo-input.log",
-                format!(
-                    "[input] tap mode = {}\n{}\n",
-                    if active_tap {
-                        "default/swallow（输入监控已授权 → 桌宠区域点击不穿透）"
-                    } else {
-                        "listen-only（缺「输入监控」权限 → 点击会穿透到桌面、键盘收不到）\n\
-                         → 若系统设置已勾选仍显示本行：\n\
-                         1) 核对下方 binary 路径与设置列表条目是否同一 app（旧签名/旧路径条目无效，删除后重加）\n\
-                         2) 完全退出并重启本 app（TCC 不刷新运行中进程的输入监控授权，热升级轮询可能永远等不到）"
-                    },
-                    permission_snapshot()
-                ),
+                format!("[input] tap mode = {mode_line}\n{}\n", permission_snapshot()),
             );
             println!("[input] ✓ CGEventTap created on attempt #{attempt}");
 
@@ -825,26 +837,26 @@ fn run_worker(app: AppHandle) {
                     }
                     CGEvent::tap_enable(&tap, true);
                 }
-                // ListenOnly 运行期间持续检查输入监控：一旦用户授权，
-                // 立刻跳出重建为 Default tap（可吞事件），无需重启应用。
-                // 每 10s 把权限实时值写诊断日志：用户勾选后若此值恒 false，
-                // 说明 TCC 不刷新运行中进程（需重启 app）或勾选条目不是当前二进制。
+                // ListenOnly 运行期间持续检查权限：Default tap 需要
+                // ListenEvent + AX 双权限齐备才重建（只满足其一时重建必失败，
+                // 会陷入"重建→失败→回退→再重建"死循环，见 can_swallow 注释）。
+                // 每 10s 把权限实时值写诊断日志，区分「条目错误」vs「TCC 不刷新」。
                 if !active_tap && now_ms() - last_perm_check >= 2000 {
                     last_perm_check = now_ms();
                     poll_n += 1;
                     let granted_now = listen_event_granted();
+                    let ax_now = unsafe { AXIsProcessTrusted() };
                     if poll_n % 5 == 0 {
                         crate::dlog(&format!(
-                            "[input] listen-only poll #{poll_n}: ListenEvent={granted_now} AX={}",
-                            unsafe { AXIsProcessTrusted() }
+                            "[input] listen-only poll #{poll_n}: ListenEvent={granted_now} AX={ax_now}"
                         ));
                     }
-                    if granted_now {
-                        println!("[input] 输入监控已授权 → 重建 Default tap（防穿透生效）");
+                    if granted_now && ax_now {
+                        println!("[input] 双权限齐备 → 重建 Default tap（防穿透生效）");
                         let _ = std::fs::write(
                             "/tmp/wuwatappo-input.log",
                             format!(
-                                "[input] Input Monitoring granted — rebuilding Default tap\n{}\n",
+                                "[input] Input Monitoring + Accessibility granted — rebuilding Default tap\n{}\n",
                                 permission_snapshot()
                             ),
                         );

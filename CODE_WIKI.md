@@ -1396,6 +1396,27 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
 2. **SDK 静默失败**（init 网络请求失败被 catch → console.warn 不落盘）：无 window.onerror 不代表无失败——axios 错误走 Promise 链。**已部署强诊断**：login 窗口注入 `[login-diag]`（on_page_load Finished 时机，早于 SDK 加载）——XHR/fetch 全量 hook（URL/status/网络失败标记）+ 2s/6s/12s 三次 DOM/KrSDK 状态 dump（#app 内容长度、body 子节点、typeof KrSDK、getInitStatus、__KUROJSSDKSTATE__、scripts/styleSheets 清单），一次复现即可定位断点。
 3. WKWebView 磁盘缓存旧 bundle（README §2）：复现前清 `~/Library/Caches/com.kuro.wuwatappo.cn`。
 
+**🎯 根因已锁定（11-02 [login-diag] 实锤）：重建壳漏发 `login-modal-open` 事件**
+
+诊断数据（用户复现，login 窗口 [login-diag]）：
+- KrSDK 脚本加载成功（`KrSDK=object init=true`）、`POST /sdkcom/v2/sys/conf.lg → 200 len=1853`、`DIV#KrSDK` 容器已挂载
+- 但 `__KUROJSSDKSTATE__` 只有 init 配置字段、**无 `viewType:"login"`** → `KrSDK.core.openLoginView()` 从未被调用 → 浮层永不弹
+- `#app` innerHTML 仅 74 字符（login 卡片不渲染）→ 透明窗口 + 红底 = 用户所见"什么都没发生/红色方块"
+- 前端反复重试 `open_login_window`（单次会话 17 次、累计 64 次）——等待窗口就绪确认的表现
+
+**事件契约（modalBridge-DrPKsAwT.js + 官方 exe 字符串表双重实锤）**：login 页前端 `listenLoginModalOpen` 监听 **`login-modal-open`** 事件，收到后才调 `openLoginView()`。官方 Rust 壳在 login 窗口就绪后 emit 该事件（exe 字符串表存在 `login-modal-open`，与 `cat-force-update-lock`、`cat-native-network-status-changed` 等官方事件名相邻）。重建壳的 `open_login_window` 只建窗口、从未 emit → 链路断在最后一环。
+
+**修复（已实施）**：`on_page_load`（login 窗口 Finished）后 spawn 线程延时连发三次 `emit_to("login", "login-modal-open", {})`（0.8s/2.3s/5.3s，覆盖 Vue 监听注册时序；前端 openLoginView 有 T 计数防并发、show() 幂等）。
+
+**关联事件契约（modalBridge 全量，供后续对齐）**：
+| 事件 | 方向 | 用途 |
+|------|------|------|
+| `login-modal-open` | **Rust → 前端**（login 窗口） | 通知登录模态已打开 → 前端调 openLoginView。**重建壳曾漏发（BUG 1 根因）** |
+| `cat-login-overlay` | 前端 → Rust（亦自监听） | KrSDK 浮层开/关状态（payload `{open:bool}`），官方 Rust 或据此调整窗口 |
+| `cat-auth-login-success` | 前端 → 全局 | 登录成功广播 |
+| `cat-auth-logout` | 前端 → 全局 | 登出广播 |
+| `cat-app-update-available` / `update-modal-open` / `maintenance-notice-open` | Rust → 前端 | 更新/维护公告（maintenance 已实现 emit） |
+
 **KrSDK 情报（kr-sdk.js v1.2.3，455KB，preact 渲染）**：
 - 配置：gameId=G152 pkgId=A1476（index-D8GJxFG7.js `isdkConfigs`）
 - API base：`https://sdkapi.kurogame.com/sdkcom` + `/v2`；端点：`/sys/conf.lg`（POST，GET 返回 405）、`/login/accLogin.lg`、`/login/phoneCode.lg`、`/login/getPhoneCode.lg`、`/login/emailPwd.lg`、`/auth/getToken.lg`、`/h5/server/list.lg`、`/h5/role/list.lg`
@@ -1416,32 +1437,23 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
 
 ### 11.2 BUG 2：应用未聚焦时键盘不计数
 
-**根因已锁定（非代码 bug，是权限态）**：`tap mode = listen-only`。macOS 10.15+ 的 TCC 将「监听键盘」归入**输入监控（Input Monitoring / kTCCServiceListenEvent）**权限；仅有「辅助功能」时 ListenOnly tap 收不到 KeyDown/KeyUp。窗口聚焦时计数走 WKWebView 原生 keydown，所以"聚焦正常、失焦失效"。
+**✅ 11-02 已解决**（用户重新授权后确认"可以正常记录输入的状态"）。
 
-**⚠️ 11-02 新情况：用户已在系统设置勾选输入监控，但 11:43 重启后的运行仍是 listen-only**（`/tmp/wuwatappo-input.log` 写入时间 11:43 实锤）。三种可能：
-1. **勾选的条目不是当前二进制**：TCC 列表可能存在多条 WuwaTappo（adhoc 时代累积的旧签名条目、不同路径的副本）。当前运行的二进制路径以 input.log 新增的 `binary =` 行为准。
-2. **TCC 不刷新运行中进程的 ListenEvent 授权**：Apple 对 kTCCServiceListenEvent 的已知行为——授权后目标 app 必须重启；代码内 2s 热升级轮询（`CGPreflightListenEventAccess`）可能对运行中进程恒返回旧值。若勾选发生在 11:43 运行期间，则属此类，重启即愈。
-3. TCC 记录损坏：`tccutil reset ListenEvent com.kuro.wuwatappo.cn` 清空后重新走系统弹窗授权。
+**权限模型修正（11-02 实测，macOS 26 / Darwin 27.2）**——此前认知不完全准确：
 
-**已部署诊断增强（input.rs）**：
-- tap 建立时 input.log 写入 `binary = <当前二进制绝对路径>` + `AXIsProcessTrusted` + `CGPreflightListenEventAccess` 实时值
-- listen-only 轮询每 10s 向 `/tmp/wuwatappo-diag.log` 写一行 `listen-only poll #N: ListenEvent=? AX=?`——勾选后观察此值是否翻转，直接区分可能性 1/2
+| 权限 | ListenOnly tap | Default tap（可吞事件） |
+|------|---------------|------------------------|
+| 输入监控（ListenEvent） | **键盘事件的必要条件** | 必要 |
+| 辅助功能（AX） | ListenOnly 可在 AX=false 时建立并收到键鼠（实测） | **必要**（AX=false 时 tap_create(Default) 返回 null） |
 
-**标准重置流程（推荐给用户执行）**：
-```bash
-# 1. 杀掉 app
-pkill -9 -f wuwatappo
-# 2. 清空两类 TCC 记录（会同时清掉旧签名的僵尸条目）
-tccutil reset ListenEvent com.kuro.wuwatappo.cn
-tccutil reset Accessibility com.kuro.wuwatappo.cn
-# 3. 系统设置 → 隐私与安全性 → 辅助功能/输入监控：手动删除残留的 WuwaTappo 条目
-# 4. 启动新版 app（系统弹窗授权 → 允许；若没弹窗则手动勾选，注意核对条目路径）
-open src-tauri/target/release/bundle/macos/WuwaTappo.app
-# 5. 验证
-cat /tmp/wuwatappo-input.log   # 期望 tap mode = default/swallow
-```
+**授权后引出的真 bug（已修）**：`ListenEvent=true && AX=false` 状态下，热升级轮询每 ~2s 立即满足 `listen_event_granted()` → break → 重建 Default tap → 因缺 AX 失败 → 回退 ListenOnly → 轮询又立即 break……**无限循环重建 tap**，重建窗口期事件丢失（键鼠间歇失效，"拖动时常失效"的来源之一）。修复：升级/重建条件改为**双权限齐备**（`listen_event_granted() && AXIsProcessTrusted()`）。
 
-**产品化改进（待办）**：listen-only 时前端弹 toast 明确提示"需要输入监控权限，授权后请重启应用"，而非静默降级——当前只有 /tmp 日志和一闪而过的系统设置窗口，用户几乎必然忽略。
+**诊断增强（已实施）**：input.log 写入 `binary=`（当前二进制绝对路径）+ `AXIsProcessTrusted` + `CGPreflightListenEventAccess` 实时值；listen-only 文案按权限组合区分真实原因（曾误导用户对着「输入监控」面板反复授权，实际缺的是「辅助功能」）；轮询每 10s 向 diag.log 写权限值。
+
+**遗留事项**：
+- 当前用户机器 AX 仍为 false → 桌宠区域点击仍会穿透桌面（Default tap 未生效）。需在 系统设置→辅助功能 中删旧条目、按 input.log 的 binary 路径重新添加并勾选，然后重启 app。
+- **自签名证书（TeamIdentifier=not set）不能保证 TCC 授权跨编译保持**（11-02 实锤推翻此前认知）：每次重编译后应提示用户核对授权；产品化方案是在 app 内检测 listen-only 状态并弹 toast 引导。
+- 产品化改进（待办）：listen-only 时前端弹 toast 明确提示缺哪项权限，而非静默降级。
 
 ### 11.3 BUG 3：桌宠拖动/点击互动时常失效
 

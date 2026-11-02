@@ -1365,12 +1365,15 @@ pub fn run() {
   try { inv = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke; } catch(e){}
   function w(m){ try { inv && inv('write_app_log', {level:'error', message:'[login-diag] '+m}); } catch(e){} }
   w('installed ua=' + navigator.userAgent + ' href=' + location.href);
+  // 只记录外部网络请求；ipc://localhost 是 Tauri 内部命令通道（Rust 侧已有
+  // [cmd] 日志），且 write_app_log 本身走 fetch ipc —— 记录它会自我循环刷屏。
+  function ext(u){ return String(u).indexOf('ipc://localhost') !== 0; }
   // XHR hook
   var XO = XMLHttpRequest.prototype.open, XS = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function(m, u){ this.__d = m + ' ' + u; return XO.apply(this, arguments); };
+  XMLHttpRequest.prototype.open = function(m, u){ this.__d = m + ' ' + u; this.__ext = ext(u); return XO.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function(b){
     var x = this;
-    x.addEventListener('loadend', function(){
+    if (x.__ext) x.addEventListener('loadend', function(){
       w('XHR ' + x.__d + ' -> ' + x.status + (x.status === 0 ? ' (NETWORK FAIL/CORS)' : ' len=' + String(x.responseText || '').length));
     });
     return XS.apply(this, arguments);
@@ -1380,6 +1383,7 @@ pub fn run() {
     var F = window.fetch;
     window.fetch = function(u, o){
       var url = typeof u === 'string' ? u : (u && u.url);
+      if (!ext(url)) return F.apply(this, arguments);
       return F.apply(this, arguments).then(function(r){ w('fetch ' + url + ' -> ' + r.status); return r; },
         function(e){ w('fetch ' + url + ' -> FAIL ' + e); throw e; });
     };
@@ -1388,6 +1392,7 @@ pub fn run() {
   function dump(tag){
     try {
       var app = document.querySelector('#app');
+      var sdkDiv = document.querySelector('#KrSDK');
       var kids = [].map.call(document.body.children, function(n){
         return n.tagName + (n.id ? '#' + n.id : '') + (n.className && typeof n.className === 'string' ? '.' + n.className.trim().split(/\s+/).slice(0,2).join('.') : '');
       }).join(' | ');
@@ -1396,10 +1401,11 @@ pub fn run() {
       var initSt = 'n/a';
       try { initSt = String(window.KrSDK && window.KrSDK.core && window.KrSDK.core.getInitStatus && window.KrSDK.core.getInitStatus()); } catch(e){}
       var scripts = [].map.call(document.scripts, function(s){ return s.src ? s.src.slice(-40) : 'inline'; }).join(',');
-      w('dump[' + tag + '] appHTML=' + (app ? app.innerHTML.length : 'NO#APP') +
+      w('dump[' + tag + '] appHTML=' + (app ? app.innerHTML.length + '{' + app.innerHTML.slice(0, 100) + '}' : 'NO#APP') +
+        ' sdkDiv=' + (sdkDiv ? sdkDiv.innerHTML.length + '{' + sdkDiv.innerHTML.slice(0, 150) + '}' : 'none') +
         ' bodyKids={' + kids + '}' +
         ' KrSDK=' + typeof window.KrSDK + ' init=' + initSt +
-        ' sdkState=' + String(sdkState).slice(0, 200) +
+        ' sdkState=' + String(sdkState).slice(0, 250) +
         ' stylesheets=' + document.styleSheets.length +
         ' scripts=[' + scripts + ']');
     } catch(e){ w('dump[' + tag + '] failed: ' + e); }
@@ -1411,6 +1417,30 @@ pub fn run() {
 "#,
                     );
                     dlog("[login] strong diagnostics injected");
+                    // ===== BUG 1 根因修复：补发官方 login-modal-open 事件 =====
+                    // modalBridge chunk 实锤：login 页前端 listenLoginModalOpen
+                    // 监听 "login-modal-open"，收到后才调 KrSDK.core.openLoginView()
+                    // 弹登录浮层（官方 exe 字符串表存在该事件名）。重建壳此前漏发
+                    // → SDK 加载+init 成功但浮层永不弹（__KUROJSSDKSTATE__ 无
+                    // viewType、#app 空渲染、前端反复重试 open_login_window）
+                    // → 透明窗口整窗不可见（"点了登录什么都没发生"/只见红底）。
+                    // Vue 监听注册晚于 PageLoad Finished，延时连发三次防错过
+                    // （前端 openLoginView 有 T 计数防并发、show() 幂等）。
+                    let app2 = webview.app_handle().clone();
+                    std::thread::spawn(move || {
+                        for delay_ms in [800u64, 1500, 3000] {
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            if app2.get_webview_window("login").is_none() {
+                                break; // 窗口已关，停发
+                            }
+                            let _ = app2.emit_to(
+                                "login",
+                                "login-modal-open",
+                                serde_json::json!({}),
+                            );
+                            dlog("[login] emitted login-modal-open");
+                        }
+                    });
                 }
             }
         })
