@@ -17,6 +17,7 @@ use tauri::{
 use tauri_plugin_updater::UpdaterExt;
 
 mod input;
+mod ws_proxy;
 
 /// 桌宠缩放档位（前端 PET_SCALE_MIN=50 / MAX=200 / DEFAULT=100）
 const PET_SCALE_STEPS: [f64; 7] = [50.0, 75.0, 100.0, 125.0, 150.0, 175.0, 200.0];
@@ -1285,6 +1286,10 @@ pub fn run() {
                 std::sync::atomic::AtomicBool::new(false),
             )));
             app.manage(LoginIntent(Mutex::new("login".into())));
+
+            // 房间 socket.io 本地中继代理：服务端 Origin 白名单拒绝
+            // tauri://localhost（403），代理外发时重写为官方 Windows 值
+            ws_proxy::spawn();
 
             // 托盘
             let _tray = TrayIconBuilder::with_id("main-tray")

@@ -32,6 +32,11 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFMachPort", "CFRunLoop"] }
 # NSWindow setLevel：aux 窗口层级抬到 floating+1，恒高于 main（窗口分层方案）
 objc2 = "0.6"
+# 房间 socket.io 本地中继代理：服务端 Origin 白名单只放行 http://tauri.localhost，
+# WKWebView 的 tauri://localhost 被 403（ws_proxy.rs），代理外发时重写 Origin
+tokio = { version = "1", features = ["net", "io-util"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
 
 [profile.release]
 codegen-units = 1
