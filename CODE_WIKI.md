@@ -544,20 +544,30 @@ emit → main 窗口前端
 
 **坐标换算**：CGEvent location 是全局逻辑点；`hit_test` 直接与 Tauri `outer_position`（同为逻辑坐标）相减得到窗口内 CSS 坐标。而 `mouse-move` 的 payload 需要**物理像素**（前端 `Ht()` 用 `(x − innerPosition) / scaleFactor` 还原），因此 emit 前按鼠标所在显示器 backing scale 乘算。
 
-#### main 与辅助窗口的层级关系（`sync_main_layer`）
+#### main 与辅助窗口的层级关系（NSWindow level 物理分层）
 
-`main` 配置为 `alwaysOnTop: true` 且覆盖全屏，与 login/panel 同属 floating level。macOS 上同层窗口谁最后 `orderFront` 谁在上面，`main` 只要被激活就会盖住辅助窗口——实测出现过 `login: visible=true` 但用户完全看不见的情况。
+`main` 配置为 `alwaysOnTop: true` 且覆盖全屏（floating level 3）。Tauri 的 `set_always_on_top` 只能在 normal(0)/floating(3) 之间切换，同层窗口靠 `orderFront` 时序决定遮挡、不可控。**旧方案**"有 aux 时把 main 降级"（`main.set_always_on_top(!has_aux)`）产生两类实测事故：
 
-`sync_main_layer(app)` 的处理：
+1. `create_aux_window_min` 的"窗口已存在"早退路径不走层级同步 → login 窗口 `visible=true` 但被 main 盖住，点登录"没反应"（06:09 复现）；
+2. 前端 JS 自行关闭 panel（绕过 `close_panel_window` 命令）→ `sync_main_layer` 不执行 → main 永久停留在降级层，桌宠被其他 app 窗口覆盖。
+
+**现方案**：物理分层，`main` 恒 floating(3) 永不降级；aux 窗口（panel/login/toast/update）创建/show 后用 objc2 `setLevel(4)`（`ensure_aux_level`）抬到 floating+1，恒压 main 之上：
 
 ```rust
-// 只要有可见的辅助窗口，就把 main 降为非置顶（normal level）
-let has_aux = webview_windows().iter()
-    .any(|(label, w)| label != "main" && w.is_visible().unwrap_or(false));
-main.set_always_on_top(!has_aux);
+#[cfg(target_os = "macos")]
+const AUX_WINDOW_LEVEL: i64 = 4; // NSFloatingWindowLevel + 1
+
+fn ensure_aux_level<R: Runtime>(win: &tauri::WebviewWindow<R>) {
+    if let Ok(ns) = win.ns_window() {
+        unsafe {
+            let obj = ns as *mut objc2::runtime::AnyObject;
+            let _: () = objc2::msg_send![obj, setLevel: AUX_WINDOW_LEVEL];
+        }
+    }
+}
 ```
 
-调用时机：`create_aux_window_min` 创建成功后、以及每个 `close_*_window` 关闭后。辅助窗口全部关闭时 main 恢复置顶，桌宠继续常在最前。
+⚠️ 任何对 aux 窗口再调 `set_always_on_top(true)` 都会把 level 重置回 3，必须随后补调 `ensure_aux_level`（`raise_panel_window_above_pets`、toast/existed 分支均已处理）。`sync_main_layer` 保留为幂等兜底：只负责把 main 恢复 `always_on_top(true)`。
 
 #### 创建函数
 
@@ -809,8 +819,9 @@ app.emit("tray-set-pet-scale", 125.0)
 | `rebuild_tray_menu` | `fn rebuild_tray_menu(app, st) → Result<()>` | 重建托盘菜单（按 TrayState） |
 | `build_dock_menu` | `pub fn build_dock_menu(app, st) → Result<Menu>` | 构建桌宠菜单（托盘/右键共用） |
 | `handle_menu_event` | `fn handle_menu_event(app, id)` | 菜单项事件分发 |
-| `create_aux_window_min` | `fn create_aux_window_min(app, label, route, title, w, h, resizable, min_w, min_h) → Result<()>` | 带最小尺寸的辅助窗口创建（创建后 `sync_main_layer` + 刷新几何） |
-| `sync_main_layer` | `fn sync_main_layer(app)` | 有辅助窗口时把 main 降为非置顶，全部关闭后恢复 |
+| `create_aux_window_min` | `fn create_aux_window_min(app, label, route, title, w, h, resizable, min_w, min_h) → Result<()>` | 带最小尺寸的辅助窗口创建（创建/show 后 `ensure_aux_level` 抬到 level 4 + 刷新几何） |
+| `sync_main_layer` | `fn sync_main_layer(app)` | 幂等兜底：把 main 恢复 `always_on_top(true)`（新方案 main 恒置顶，不再降级） |
+| `ensure_aux_level` | `fn ensure_aux_level(win)` | objc2 `setLevel(4)`：aux 窗口恒压 main（floating 3）之上 |
 | `open_panel` | `fn open_panel(app, tab) → Result<()>` | 打开 panel 并聚焦 tab |
 | `dlog` | `pub fn dlog(msg: &str)` | 双写诊断日志（stdout + /tmp 文件） |
 | `chrono_date` / `chrono_time` | `fn → String` | 自实现日期/时间格式化 |
@@ -1205,7 +1216,7 @@ cat ~/Library/Application\ Support/com.kuro.wuwatappo.cn/native-store/store.json
 | 8 | **Default tap 优先、ListenOnly 降级** | macOS 只有 Default（active）tap 能吞事件实现"点击不穿透"，但它额外要求「输入监控」权限；ListenOnly 只需「辅助功能」但点击必穿透且收不到键盘。因此运行时按权限探测结果动态选择，并在拿到权限后热切换 | run_worker() |
 | 9 | **通道化事件发送** | tap 回调超时会让事件被系统丢弃（KeyUp 丢失 → 按键重复刷屏）。回调只做内存判断 + `try_send`，emit/写盘/主线程 API 全部移到 `input-emitter` 线程 | TapMsg + spawn_emitter |
 | 10 | **几何缓存替代实时窗口查询** | Tauri 窗口 API 必须在主线程；在 tap 线程调用会导致进程静默崩溃。改为主线程维护 `SharedMainGeom` 快照，回调只读 | MainGeom + refresh_main_geom |
-| 11 | **辅助窗口打开时降 main 层级** | main 是全屏 alwaysOnTop 窗口，与辅助窗口同层会盖住它们（login 可见状态为 true 但看不见）。`sync_main_layer` 按辅助窗口可见性动态切换 main 的置顶 | sync_main_layer |
+| 11 | **aux 窗口用 NSWindow level 物理分层，main 恒置顶** | main 是全屏 alwaysOnTop(3) 窗口，与辅助窗口同层靠 orderFront 时序不可控（login visible=true 但被盖住；panel 经前端 JS 关闭绕过 Rust 命令 → main 降级后永不恢复、桌宠被其他 app 盖）。旧"动态降 main"方案已废弃：aux 创建/show 后 `ensure_aux_level` setLevel(4)，main 永不降级 | ensure_aux_level / sync_main_layer |
 | 12 | **固定证书签名** | adhoc 签名每次编译 cdhash 变化，TCC 授权失效，用户被迫反复授权。改用固定证书（`WuwaTappo Dev Signing`）后授权跨编译保持 | 构建流程 |
 
 ### 9.2 开发者必读：macOS 移植踩坑记录（改相关代码前必读）
@@ -1255,7 +1266,7 @@ Tauri/tao 的 `get_webview_window` / `outer_position` / `is_visible` 必须在�
 
 **§13 全屏 main 窗口会盖住辅助窗口**
 `main` 是 `alwaysOnTop: true` 的全屏 floating 窗口，与 login/panel 同层。macOS 同层窗口按最后 `orderFront` 排序，main 一旦被激活就盖住辅助窗口——实测出现 `login: visible=true` 但用户完全看不见。
-修复：`sync_main_layer` —— 只要有可见辅助窗口就把 main 降为非置顶，全部关闭后恢复。注意**不要**用 `set_background_color` 给辅助窗口铺底色（会在圆角卡片外露出方形色块）。
+修复：**NSWindow level 物理分层** —— main 恒 floating(3) 置顶，aux 窗口 `ensure_aux_level` setLevel(4) 恒压其上；`sync_main_layer` 退化为幂等兜底（只恢复 main 置顶）。注意**不要**用 `set_background_color` 给辅助窗口铺底色（会在圆角卡片外露出方形色块）；对 aux 再调 `set_always_on_top(true)` 会把 level 重置回 3，必须补调 `ensure_aux_level`。
 
 **§14 Cmd+Q 退出后旧实例复用**
 bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代码没效果"。每次测试前必须 `pkill -9 -f wuwatappo` 再 `open`。
@@ -1387,7 +1398,7 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
 
 **已排除的假设（勿重蹈）**：
 - ~~KrSDK URL protocol-relative~~：isdkSrc/isdkCss 已是 `https://`（补丁生效）
-- ~~login 被 main 盖住~~：`sync_main_layer` 生效，diag 确认 `login visible=true 520×440`
+- ~~login 被 main 盖住~~：`sync_main_layer` 生效，diag 确认 `login visible=true 520×440` **（第三轮部分推翻：新建窗口路径生效，但"窗口已存在"早退路径不走 sync → 隐藏后重新 show 的 login 窗口仍被 main 盖住；已由 level 物理分层根除）**
 - ~~窗口尺寸裁切~~：520×440 容得下 500×378 卡片
 - ~~CORS 拦截~~：**11-02 curl 实测排除**——SDK 真实端点为 `https://sdkapi.kurogame.com/sdkcom/v2/*`（注意 `/v2` 前缀，kr-sdk.js 内 `apiVerison="/v2"` 拼接；不带 /v2 的路径预检 403 "Invalid CORS request" 是 nginx 对未知路径的行为，曾误导诊断）。`/v2` 路径预检返回 `200 + access-control-allow-origin: *`，对包括 `tauri://localhost` 在内的任意 Origin 开放。游戏 API（api-mc-wuwatappo）与遥测（mp-cn-sdklog）则动态回显 Origin。
 - ~~JS 执行错误~~：11-02 运行 app log 零 `onerror`/`unhandledrejection` 记录（对比 10-28 旧构建同场景 2266 次 `Script error.` 刷屏），login 页心跳正常（diag 脚本活着，页面 JS 环境正常）。
@@ -1409,7 +1420,7 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
 
 **修复（已实施，11-02 两轮迭代）**：
 1. 第一轮：`on_page_load`（login Finished）后 spawn 线程延时连发三次 `emit_to("login", "login-modal-open", {})` → **实测浮层成功渲染**（`DIV.login-select-popup` 登录选择弹层出现，用户确认"联机和宝箱弹出登录框"），根因确认。
-2. 第二轮（intent 语义修正）：login chunk 回调实为 `r?.intent==="show" ? K() : n()`——`K()`→`ze()` 检查**外服**角色信息（CN 场景恒 false，什么都不做）；**`n()` 才是国服登录路径**（等 SDK ready → 弹浮层）。固定发 `"show"` 会破坏国服登录，正确做法是**透传 `open_login_window` 的 intent 参数**（login 按钮="login"、联机="room"，经 `LoginIntent` state 中转到 on_page_load）；窗口已存在的重显场景（show/focus 不重新触发 on_page_load）则直接补发 `{"intent":"show"}`。
+2. 第二轮（intent 语义修正）：login chunk 回调实为 `r?.intent==="show" ? K() : n()`——`K()`→`ze()` 检查**外服**角色信息（CN 场景恒 false，什么都不做）；**`n()` 才是国服登录路径**（等 SDK ready → 弹浮层）。固定发 `"show"` 会破坏国服登录，正确做法是**透传 `open_login_window` 的 intent 参数**（login 按钮="login"、联机="room"，经 `LoginIntent` state 中转到 on_page_load）。~~窗口已存在的重显场景直接补发 `{"intent":"show"}`~~ **（第三轮推翻：existed 分支同样必须透传真实 intent——CN 未登录时 "show"→K() 恒无操作，见第三轮复盘 #2）**。
 
 **login 窗口自动关闭机制（逆向确认，勿误诊为 bug）**：login 页 setup 注册了多个关闭触发器——`cat-auth-login-success`（Tauri 事件 + DOM 事件双通道，登录成功即关窗）、`cat-login-overlay {open:false}`（浮层关闭 → 120ms 延时 `closeLoginWindow`）、`cat-pass-login-overlay` DOM 事件同理。因此"窗口开了又很快自己关"通常是登录成功或浮层被关闭的正常链路。
 
@@ -1451,6 +1462,16 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
    - init=true + 浮层未渲染 → dump body 子节点查 preact 挂载点/CSS
 ⑤ 根因修复后移除红底诊断代码（lib.rs open_login_window）
 ```
+
+**第三轮复盘（11-02 下午，用户实测"登录不弹框/登录态丢失/桌宠不置顶"）**：
+
+1. **部署事故（首要教训）**：13:11 构建的二进制**不含 cookie shim 与 dump 检查**（源码有、产物无——最后一次后台 build 未编译进最终编辑）。用户实测的仍是无 shim 版本。**规约：每次构建后必须 `strings` 二进制验证修复标记串，命中才能重启部署**（本轮 7 个标记全命中后才切换）。
+2. **"点击登录不弹框"根因**：login 窗口隐藏存活（WebContent 进程被系统回收后 `show()` 触发 reload），`open_login_window` 走"窗口已存在"分支——旧代码只 show+focus 不走层级同步 → 被恒 floating 的全屏 main 盖住；且该分支硬编码补发 `intent="show"` → 前端 `K()`（`We()` 检查登录信息，CN 未登录恒 false）= 静默无操作。**修复**：existed 分支补 `set_always_on_top(true)+ensure_aux_level+sync_main_layer`，intent 改为透传 `LoginIntent` state 真实值（前端 modalWindows chunk 实锤：调用方恒传 `intent:"login"`，"show" 仅外服 `completeForeignBrowserLogin` 使用）。
+3. **"登录态丢失"链路证据（app log [login-diag]）**：06:01:41 用户 SDK 登录**实际成功**——`phoneCode.lg → 200`（cuid=546632640）+ `auth/getToken.lg → 200`（access_token 到手）。但同秒 `[cmd] close_login_window`，且日志中**无** `api/auth/player/query`、`api/auth/login` 的 XHR 记录（hook 只在 loadend 落盘，在途被杀无痕迹）。官方成功链：`onLoginSuccessful → Sn(queryPlayer api/auth/player/query) → se(api/auth/login) → afterLogin → applyAuthTokens(setCookie kuro_infoToken) → emit cat-auth-login-success → 关窗`。断点二选一：回调未触发/绑定被跳过（`handleInlandSDKLogin` 在 SDK init generation `rn()<=0` 时仅 console.warn 跳过绑定），或回调触发但 `renewTokenBeforeRequest`（每请求前读 cookie）因 cookie 禁用即刻抛错 → catch → finally `_(!1)`（overlay close）→ 前端 120ms 自毁 → 与 getToken 同秒关窗。**两说都指向 cookie shim 是必要条件**；shim 本轮才真正部署。
+4. **防腰斩保护（双保险）**：Rust `close_login_window` 延迟 1200ms 销毁（login 窗口透明空内容，无感知）；JS 注入在 getToken 200 后 8s 内把两条 overlay-close 通路（`cat-pass-login-overlay` 本地 DOM 事件 + `cat-login-overlay` Tauri 广播 `plugin:event|emit`）各延迟 3s。
+5. **诊断增强（本轮已部署）**：console.warn/error hook（捕获 "skip KrSDK login handler binding"/"complete KrSDK setup failed"/"Inland SDK login: queryPlayer failed" 三个致命静默告警）、window error/unhandledrejection、KrSDK.event.on/emit 包装（记录事件注册与触发+payload，轮询 200ms 等 SDK 出现）、关键 XHR 增加 SEND 时点日志（区分"没发出"与"发出被杀"）。**下次复现的判读**：有 `KrSDK event FIRED onLoginSuccessful` + 有 `XHR> SEND .../player/query` = 链路已通、看响应体；有 FIRED 无 SEND = 回调内同步抛错、看 console.error；无 FIRED = SDK 事件层断裂或未绑定、看 REGISTER 日志。
+6. **"桌宠不置顶"根因**：旧 `sync_main_layer` 降级方案的旁路缺口（前端 JS 自行关 panel 绕过 Rust 命令 → main 永久降级）。已由 NSWindow level 物理分层方案根除（见"main 与辅助窗口的层级关系"节）。
+7. **jsonpClient 名不副实**：`index-D8GJxFG7.js` 的 `jsonpClient` 实为 axios 实例（`new Request({timeout,baseURL:HOST})`），`api/auth/login`、`api/auth/player/query` 均走 XHR，非 script 注入 JSONP——XHR hook 可完整捕获。
 
 ### 11.2 BUG 2：应用未聚焦时键盘不计数
 

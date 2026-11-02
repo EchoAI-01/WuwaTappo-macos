@@ -5436,6 +5436,7 @@ name = "wuwatappo-macos"
 version = "1.0.1"
 dependencies = [
  "log",
+ "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "serde",

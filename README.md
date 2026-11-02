@@ -115,7 +115,11 @@ emit → main 窗口前端
 
 WKWebView 会对"无活动"页面执行 **idle 挂起**（JS 冻结、timer 停转）——用户点开登录窗后 main 页面即被冻结，表现为"按键统计停止、桌宠无响应"（Windows WebView2 无此行为）。Rust 侧后台线程每 5 秒对所有窗口 `eval("void 0")` 维持活跃。
 
-### 3.5 前端补丁清单（对官方 dist 的全部修改）
+### 3.5 窗口层级：NSWindow level 物理分层（macOS 特有）
+
+Tauri `set_always_on_top` 只能在 normal(0)/floating(3) 两档切换，同层窗口遮挡靠 `orderFront` 时序、不可控。旧方案"有辅助窗口时把 main 降级"有两类实测事故：existed 早退路径不同步层级 → login 窗口被全屏 main 盖住（点登录"没反应"）；前端 JS 自行关 panel 绕过 Rust 命令 → main 永久降级、桌宠被其他 app 覆盖。现方案：**main 恒 floating(3) 永不降级；aux 窗口（panel/login/toast/update）创建/show 后 objc2 `setLevel(4)` 恒压 main 之上**（`ensure_aux_level`）。注意对 aux 再调 `set_always_on_top(true)` 会重置回 3，须补调 `ensure_aux_level`。
+
+### 3.6 前端补丁清单（对官方 dist 的全部修改）
 
 官方 dist 除以下补丁外字节不动：
 

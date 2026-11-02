@@ -161,6 +161,8 @@ async fn show_toast_overlay<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
     const TOAST_LABEL: &str = "toast";
     if let Some(win) = app.get_webview_window(TOAST_LABEL) {
         let _ = win.show();
+        let _ = win.set_always_on_top(true);
+        ensure_aux_level(&win);
         let _ = win.set_focus();
         return Ok(());
     }
@@ -189,6 +191,9 @@ async fn show_toast_overlay<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
         }
     }
     b.build().map_err(|e| e.to_string())?;
+    if let Some(win) = app.get_webview_window(TOAST_LABEL) {
+        ensure_aux_level(&win);
+    }
     Ok(())
 }
 
@@ -660,6 +665,30 @@ fn hide_main_after_maintenance_notice_ready<R: Runtime>(app: AppHandle<R>) {
 // 辅助窗口管理（modalWindows/appAutostart chunk，12 个）
 // ---------------------------------------------------------------------------
 
+/// aux 窗口 NSWindow 层级：NSFloatingWindowLevel(3)+1，恒压在 main 之上。
+///
+/// Tauri 的 set_always_on_top 只能在 normal(0)/floating(3) 之间切换，同层窗口
+/// 靠 orderFront 时序决定遮挡、不可控（实测两类事故：login 窗口 visible=true
+/// 但被全屏 main 盖住——点登录"没反应"；main 降级后未恢复——桌宠被其他 app 盖）。
+/// 直接 setLevel(4) 物理分层：main 恒 floating(3) 压其他 app，aux 恒 4 压 main。
+/// 注意：任何对 aux 窗口再调 set_always_on_top(true) 都会把 level 重置回 3，
+/// 必须随后补调本函数。
+#[cfg(target_os = "macos")]
+const AUX_WINDOW_LEVEL: i64 = 4;
+
+#[cfg(target_os = "macos")]
+fn ensure_aux_level<R: Runtime>(win: &tauri::WebviewWindow<R>) {
+    if let Ok(ns) = win.ns_window() {
+        unsafe {
+            let obj = ns as *mut objc2::runtime::AnyObject;
+            let _: () = objc2::msg_send![obj, setLevel: AUX_WINDOW_LEVEL];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_aux_level<R: Runtime>(_win: &tauri::WebviewWindow<R>) {}
+
 /// 通用辅助窗口创建（hash 路由与官方一致：#/panel /#/login /#/update /#/about /#/oss-notice）
 fn create_aux_window<R: Runtime>(
     app: &AppHandle<R>,
@@ -687,7 +716,13 @@ fn create_aux_window_min<R: Runtime>(
 ) -> tauri::Result<()> {
     if let Some(win) = app.get_webview_window(label) {
         let _ = win.show();
+        // existed 早退路径同样要压层+抬层：隐藏窗口的 WebContent 进程可能被系统
+        // 回收，show() 后窗口层级/顺序状态不可假设（实测 login 窗口 show 后仍被
+        // main 盖住 → 点登录"没反应"）。
+        let _ = win.set_always_on_top(true);
+        ensure_aux_level(&win);
         let _ = win.set_focus();
+        sync_main_layer(app);
         return Ok(());
     }
     WebviewWindowBuilder::new(
@@ -706,32 +741,33 @@ fn create_aux_window_min<R: Runtime>(
     .always_on_top(true)
     .skip_taskbar(true)
     .build()?;
-    // 辅助窗口必须浮到 main 透明壳之上，否则被 main 的 alwaysOnTop 盖住。
+    // 辅助窗口必须浮到 main 透明壳之上：set_always_on_top(true) 升到 floating(3)
+    // 后 ensure_aux_level 再抬到 4，物理高于 main，不依赖 orderFront 时序。
     // 注意：不要设 set_background_color —— 辅助窗口是 transparent + 圆角卡片，
     // 给窗口铺底色会在圆角外露出方形色块（已踩坑回滚）。
     if let Some(win) = app.get_webview_window(label) {
         let _ = win.show();
-        let _ = win.set_focus();
         let _ = win.set_always_on_top(true);
+        ensure_aux_level(&win);
+        let _ = win.set_focus();
     }
-    // main 必须先降层，否则全屏 floating 的 main 会盖住刚创建的辅助窗口
+    // 兜底恢复 main 置顶（新方案下 main 恒置顶，此调用幂等）
     sync_main_layer(app);
     input::refresh_main_geom(app);
     Ok(())
 }
 
-/// 辅助窗口存在时把 main 从 alwaysOnTop 降下来。
+/// main 恒保持 alwaysOnTop（floating 层 3）；aux 窗口（panel/login/toast/update）
+/// 由 ensure_aux_level 抬到层 4 压在 main 之上。
 ///
-/// main 是全屏 floating 层窗口，和 login/panel 同层；同层窗口谁最后 orderFront
-/// 谁在上面，main 只要被激活就会盖住辅助窗口（实测 login visible=true 但看不见）。
-/// 辅助窗口全部关闭后再恢复置顶，保证桌宠仍然常在最前。
+/// 旧方案"有 aux 时把 main 降级"有两类实测事故：
+/// 1) create_aux_window_min 的 existed 早退不走 sync → login 窗口被 main 盖住；
+/// 2) 前端 JS 自行关闭 panel（不经 close_panel_window 命令）→ main 永久停留
+///    在降级层，桌宠被其他 app 窗口覆盖。
+/// 层级物理分离后两类问题均根除；本函数幂等，仅负责把 main 恢复到置顶。
 fn sync_main_layer<R: Runtime>(app: &AppHandle<R>) {
-    let has_aux = app
-        .webview_windows()
-        .iter()
-        .any(|(label, w)| label != "main" && w.is_visible().unwrap_or(false));
     if let Some(main) = app.get_webview_window("main") {
-        let _ = main.set_always_on_top(!has_aux);
+        let _ = main.set_always_on_top(true);
     }
 }
 
@@ -786,6 +822,8 @@ fn raise_panel_window_above_pets<R: Runtime>(app: AppHandle<R>) {
     dlog("[cmd] raise_panel_window_above_pets");
     if let Some(win) = app.get_webview_window("panel") {
         let _ = win.set_always_on_top(true);
+        // set_always_on_top 会把 level 重置回 floating(3)，必须重新抬到 4
+        ensure_aux_level(&win);
         let _ = win.set_focus();
     }
 }
@@ -825,14 +863,22 @@ fn open_login_window<R: Runtime>(
     create_aux_window(&app, "login", "/login", "WuwaTappo", 520.0, 440.0, false)
         .map_err(|e| e.to_string())?;
     if existed {
-        // 窗口已存在：show/focus 不会重新触发 on_page_load，监听早已注册，
-        // 直接补发 intent="show"（前端 K() 重显分支：CN 场景维持既有浮层）
+        // 窗口已存在：show/focus 不会重新触发 on_page_load（若 WebContent 进程
+        // 被系统回收则会 reload，由 PageLoad 补发线程兜底）。
+        // intent 必须透传真实值：前端监听器按 intent 分流——"show" 走 K()
+        // （外服已登录重显，K()=We()?(M(!0),!0):!1，CN 未登录时 We() 恒 false
+        // = 什么都不做），其余（login/room）走 n() 国服弹层。此前硬编码 "show"
+        // 导致 CN 未登录场景点登录静默无反应（实测 06:09 复现）。
+        let cur = app
+            .try_state::<LoginIntent>()
+            .map(|st| st.0.lock().unwrap().clone())
+            .unwrap_or_else(|| "login".into());
         let _ = app.emit_to(
             "login",
             "login-modal-open",
-            serde_json::json!({ "intent": "show" }),
+            serde_json::json!({ "intent": cur }),
         );
-        dlog("[login] window existed, emitted login-modal-open (intent=show)");
+        dlog(&format!("[login] window existed, emitted login-modal-open (intent={cur})"));
     }
     Ok(())
 }
@@ -840,10 +886,18 @@ fn open_login_window<R: Runtime>(
 #[tauri::command]
 fn close_login_window<R: Runtime>(app: AppHandle<R>) {
     dlog("[cmd] close_login_window");
-    if let Some(win) = app.get_webview_window("login") {
-        let _ = win.close();
-    }
-    sync_main_layer(&app);
+    // 延迟销毁保护：SDK getToken 成功后 onLoginSuccessful 异步链
+    // （queryPlayer→auth/login→afterLogin→写 cookie）仍在途中，而前端
+    // cat-login-overlay(open=false) 会触发 120ms 快速自毁（实测 06:01:41
+    // getToken 200 与 close_login_window 同秒，链路被窗口销毁腰斩，登录态丢失）。
+    // login 窗口透明且内容为空，延迟 1.2s 关闭无感知，给链路留活口。
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        if let Some(win) = app.get_webview_window("login") {
+            let _ = win.close();
+        }
+        sync_main_layer(&app);
+    });
 }
 
 #[tauri::command]
@@ -1378,6 +1432,60 @@ pub fn run() {
   try { inv = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke; } catch(e){}
   function w(m){ try { inv && inv('write_app_log', {level:'error', message:'[login-diag] '+m}); } catch(e){} }
   w('installed ua=' + navigator.userAgent + ' href=' + location.href);
+  // ===== console hook：捕获前端静默失败的关键告警 =====
+  // handleInlandSDKLogin 的三个致命分支只打 console（skip binding / setup
+  // failed / queryPlayer failed），webview console 不落盘 = 断链无证据。
+  ['warn','error'].forEach(function(k){
+    try {
+      var oc = console[k];
+      console[k] = function(){
+        try {
+          w('console.' + k + ': ' + [].slice.call(arguments).map(function(a){
+            if (a instanceof Error) return a.message;
+            if (typeof a === 'object' && a !== null) { try { return JSON.stringify(a).slice(0,200); } catch(e){ return String(a); } }
+            return String(a);
+          }).join(' ').slice(0,500));
+        } catch(e){}
+        return oc.apply(console, arguments);
+      };
+    } catch(e){}
+  });
+  window.addEventListener('error', function(ev){ try { w('window.onerror: ' + ev.message); } catch(e){} });
+  window.addEventListener('unhandledrejection', function(ev){ try { var r = ev.reason; w('unhandledrejection: ' + String(r && r.message || r).slice(0,300)); } catch(e){} });
+  // ===== SDK 登录成功时间戳 + 登录窗自毁保护 =====
+  // 实测 06:01:41：getToken 200 与 close_login_window 同秒——前端
+  // cat-login-overlay(open=false) 触发 120ms 自毁，queryPlayer→auth/login
+  // 异步链被腰斩。getToken 成功后 8s 内，把两条 overlay-close 通路
+  // （本地 DOM 事件 + Tauri cat-login-overlay 广播）各延迟 3s，保链路完整。
+  var sdkOkTs = 0;
+  var D0 = window.dispatchEvent;
+  window.dispatchEvent = function(ev){
+    try {
+      if (sdkOkTs && ev && ev.type === 'cat-pass-login-overlay' && ev.detail && ev.detail.open === false && Date.now() - sdkOkTs < 8000) {
+        w('overlay-close(local) DELAYED 3s (protecting auth chain)');
+        setTimeout(function(){ try { D0.call(window, ev); } catch(e){} }, 3000);
+        return true;
+      }
+    } catch(e){}
+    return D0.apply(window, arguments);
+  };
+  if (inv) {
+    var INV0 = inv;
+    try {
+      window.__TAURI_INTERNALS__.invoke = function(cmd, args){
+        try {
+          if (sdkOkTs && Date.now() - sdkOkTs < 8000 &&
+              (cmd === 'plugin:event|emit' || cmd === 'plugin:event|emit_to') &&
+              args && args.event === 'cat-login-overlay' &&
+              args.payload && args.payload.open === false) {
+            w('overlay-close(tauri) DELAYED 3s (protecting auth chain)');
+            return new Promise(function(res, rej){ setTimeout(function(){ INV0(cmd, args).then(res, rej); }, 3000); });
+          }
+        } catch(e){}
+        return INV0(cmd, args);
+      };
+    } catch(e){}
+  }
   // 只记录外部网络请求；ipc://localhost 是 Tauri 内部命令通道（Rust 侧已有
   // [cmd] 日志），且 write_app_log 本身走 fetch ipc —— 记录它会自我循环刷屏。
   function ext(u){ return String(u).indexOf('ipc://localhost') !== 0; }
@@ -1389,12 +1497,19 @@ pub fn run() {
   XMLHttpRequest.prototype.open = function(m, u){ this.__d = m + ' ' + u; this.__ext = ext(u); this.__key = key(u); return XO.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function(b){
     var x = this;
-    if (x.__ext) x.addEventListener('loadend', function(){
+    if (x.__ext) {
+      // 发送时点日志（仅登录关键请求）：loadend 只在完成时触发，窗口被杀时
+      // 在途请求无痕迹——SEND 日志用于区分"没发出"与"发出后被腰斩"
+      if (x.__key) w('XHR> SEND ' + x.__d);
+      x.addEventListener('loadend', function(){
+      // getToken 200 = SDK 侧登录成功，武装自毁保护 8s
+      try { if (x.status === 200 && String(x.__d).indexOf('getToken') !== -1) { sdkOkTs = Date.now(); w('SDK getToken OK, auth-chain protection armed 8s'); } } catch(e){}
       var body = '';
       if (x.__key) { try { body = ' RESP=' + String(x.responseText || '').slice(0, 300); } catch(e){}
         try { body += ' REQ=' + String(b || '').slice(0, 200); } catch(e){} }
       w('XHR ' + x.__d + ' -> ' + x.status + (x.status === 0 ? ' (NETWORK FAIL/CORS)' : ' len=' + String(x.responseText || '').length) + body);
     });
+    }
     return XS.apply(this, arguments);
   };
   // fetch hook
@@ -1411,6 +1526,37 @@ pub fn run() {
       }, function(e){ w('fetch ' + url + ' -> FAIL ' + e); throw e; });
     };
   }
+  // ===== KrSDK 事件钩子（轮询等待 SDK 加载）=====
+  // onLoginSuccessful 是否触发、payload 是否含 cuid，是"getToken 200 但
+  // queryPlayer 未发出"断链的分水岭。注入时机早于 kr-sdk.js 加载，
+  // wrap event.on 可同时记录注册与触发。
+  var sdkHooked = 0;
+  function hookSdk(){
+    if (sdkHooked) return;
+    var K = window.KrSDK;
+    if (!K || !K.event || typeof K.event.on !== 'function') return;
+    sdkHooked = 1;
+    try {
+      var origOn = K.event.on.bind(K.event);
+      K.event.on = function(name, cb){
+        w('KrSDK.event.on REGISTER ' + name);
+        return origOn(name, function(payload){
+          try { w('KrSDK event FIRED ' + name + ' payload=' + JSON.stringify(payload).slice(0,300)); }
+          catch(e){ w('KrSDK event FIRED ' + name + ' (payload unserializable)'); }
+          return cb.apply(this, arguments);
+        });
+      };
+      ['emit','dispatch','fire','trigger'].forEach(function(m){
+        if (typeof K.event[m] === 'function') {
+          var om = K.event[m].bind(K.event);
+          K.event[m] = function(name){ w('KrSDK.event.' + m + ' -> ' + name); return om.apply(null, arguments); };
+        }
+      });
+      w('KrSDK event hooks installed');
+    } catch(e){ w('KrSDK hook failed: ' + e); }
+  }
+  var hookTimer = setInterval(function(){ hookSdk(); if (sdkHooked) clearInterval(hookTimer); }, 200);
+  setTimeout(function(){ clearInterval(hookTimer); if (!sdkHooked) w('KrSDK never appeared, event hooks NOT installed'); }, 60000);
   // 延时 DOM/SDK 状态 dump
   function dump(tag){
     try {

@@ -30,6 +30,8 @@ tauri-plugin-updater = "2"
 # 全局键鼠监听（CGEventTap），选型与 ayangweb/BongoCat bongocat-platform 一致
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGEvent", "CGEventTypes"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFMachPort", "CFRunLoop"] }
+# NSWindow setLevel：aux 窗口层级抬到 floating+1，恒高于 main（窗口分层方案）
+objc2 = "0.6"
 
 [profile.release]
 codegen-units = 1
