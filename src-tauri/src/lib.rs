@@ -23,6 +23,14 @@ const PET_SCALE_STEPS: [f64; 7] = [50.0, 75.0, 100.0, 125.0, 150.0, 175.0, 200.0
 /// 窗口透明度档位（百分比）
 const OPACITY_STEPS: [f64; 5] = [20.0, 40.0, 60.0, 80.0, 100.0];
 
+/// 完整 Safari UA。
+/// WKWebView 默认 UA 缺 "Version/x Safari/x" 段（boot 日志实锤：
+/// "...AppleWebKit/605.1.15 (KHTML, like Gecko)" 到此为止），
+/// KrSDK / 登录 H5 一类页面常做 UA 嗅探，残缺 UA 可能被判定为不受支持
+/// 的环境而拒绝渲染。官方 Windows 版 WebView2 携带完整 Chrome UA，
+/// 这里对齐为 macOS Safari 完整 UA（仅辅助窗口；main 不加载 SDK）。
+const WEBVIEW_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15";
+
 /// 默认托盘文案（中文，sync_native_menu 会按语言覆盖）
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct MenuLabels {
@@ -163,6 +171,7 @@ async fn show_toast_overlay<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
         WebviewUrl::App("index.html".into()),
     )
     .title("WuwaTappo Toast")
+    .user_agent(WEBVIEW_UA)
     .transparent(true)
     .decorations(false)
     .always_on_top(true)
@@ -687,6 +696,7 @@ fn create_aux_window_min<R: Runtime>(
         WebviewUrl::App(format!("index.html#{route}").into()),
     )
     .title(title)
+    .user_agent(WEBVIEW_UA)
     .inner_size(w, h)
     .min_inner_size(min_w, min_h)
     .decorations(false)
@@ -1339,6 +1349,69 @@ pub fn run() {
                 let _ = webview.eval(
                     "document.addEventListener('contextmenu', e => e.preventDefault(), { capture: true });",
                 );
+                // login 窗口专属强诊断（BUG 1：红底可见=窗口在、内容未渲染）。
+                // 注入时机在 Finished，早于 Vue 动态 import login chunk 与
+                // KrSDK 加载，可 hook 全部网络请求。所有输出经 write_app_log
+                // 落盘（前缀 [login-diag]），一次复现即可定位断点：
+                // - KrSDK 脚本是否加载/执行（typeof KrSDK + init 状态）
+                // - openLoginView 浮层是否尝试渲染（body/#app DOM dump）
+                // - sdkapi 请求是否发出、结果如何（XHR/fetch hook）
+                if webview.label() == "login" {
+                    let _ = webview.eval(
+                        r#"
+(function(){
+  if (window.__loginDiag) return; window.__loginDiag = 1;
+  var inv = null;
+  try { inv = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke; } catch(e){}
+  function w(m){ try { inv && inv('write_app_log', {level:'error', message:'[login-diag] '+m}); } catch(e){} }
+  w('installed ua=' + navigator.userAgent + ' href=' + location.href);
+  // XHR hook
+  var XO = XMLHttpRequest.prototype.open, XS = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(m, u){ this.__d = m + ' ' + u; return XO.apply(this, arguments); };
+  XMLHttpRequest.prototype.send = function(b){
+    var x = this;
+    x.addEventListener('loadend', function(){
+      w('XHR ' + x.__d + ' -> ' + x.status + (x.status === 0 ? ' (NETWORK FAIL/CORS)' : ' len=' + String(x.responseText || '').length));
+    });
+    return XS.apply(this, arguments);
+  };
+  // fetch hook
+  if (window.fetch) {
+    var F = window.fetch;
+    window.fetch = function(u, o){
+      var url = typeof u === 'string' ? u : (u && u.url);
+      return F.apply(this, arguments).then(function(r){ w('fetch ' + url + ' -> ' + r.status); return r; },
+        function(e){ w('fetch ' + url + ' -> FAIL ' + e); throw e; });
+    };
+  }
+  // 延时 DOM/SDK 状态 dump
+  function dump(tag){
+    try {
+      var app = document.querySelector('#app');
+      var kids = [].map.call(document.body.children, function(n){
+        return n.tagName + (n.id ? '#' + n.id : '') + (n.className && typeof n.className === 'string' ? '.' + n.className.trim().split(/\s+/).slice(0,2).join('.') : '');
+      }).join(' | ');
+      var sdkState = 'none';
+      try { sdkState = JSON.stringify(window.__KUROJSSDKSTATE__ || null); } catch(e){ sdkState = 'err'; }
+      var initSt = 'n/a';
+      try { initSt = String(window.KrSDK && window.KrSDK.core && window.KrSDK.core.getInitStatus && window.KrSDK.core.getInitStatus()); } catch(e){}
+      var scripts = [].map.call(document.scripts, function(s){ return s.src ? s.src.slice(-40) : 'inline'; }).join(',');
+      w('dump[' + tag + '] appHTML=' + (app ? app.innerHTML.length : 'NO#APP') +
+        ' bodyKids={' + kids + '}' +
+        ' KrSDK=' + typeof window.KrSDK + ' init=' + initSt +
+        ' sdkState=' + String(sdkState).slice(0, 200) +
+        ' stylesheets=' + document.styleSheets.length +
+        ' scripts=[' + scripts + ']');
+    } catch(e){ w('dump[' + tag + '] failed: ' + e); }
+  }
+  setTimeout(function(){ dump('2s'); }, 2000);
+  setTimeout(function(){ dump('6s'); }, 6000);
+  setTimeout(function(){ dump('12s'); }, 12000);
+})();
+"#,
+                    );
+                    dlog("[login] strong diagnostics injected");
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![

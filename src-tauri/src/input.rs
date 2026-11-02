@@ -420,6 +420,19 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 诊断用：当前二进制路径 + 两项 TCC 权限实时值。
+/// 用户"已勾选输入监控但仍 listen-only"时需要此信息区分：
+/// - 勾选的条目指向旧二进制/旧签名（路径对不上）
+/// - TCC 对运行中进程不刷新授权（重启 app 后变 true）
+fn permission_snapshot() -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("<unknown: {e}>"));
+    let ax = unsafe { AXIsProcessTrusted() };
+    let listen = listen_event_granted();
+    format!("binary = {exe}\nAXIsProcessTrusted = {ax}\nCGPreflightListenEventAccess = {listen}")
+}
+
 /// 指针位置变化时切换窗口穿透状态（仅在跨越桌宠边界时入队）。
 /// Default tap 模式下窗口恒穿透、由吞事件处理点击，不做切换。
 fn update_pointer_mode(ctx: &TapContext, gx: f64, gy: f64) {
@@ -741,12 +754,16 @@ fn run_worker(app: AppHandle) {
             let _ = std::fs::write(
                 "/tmp/wuwatappo-input.log",
                 format!(
-                    "[input] tap mode = {}\n",
+                    "[input] tap mode = {}\n{}\n",
                     if active_tap {
                         "default/swallow（输入监控已授权 → 桌宠区域点击不穿透）"
                     } else {
-                        "listen-only（缺「输入监控」权限 → 点击会穿透到桌面）"
-                    }
+                        "listen-only（缺「输入监控」权限 → 点击会穿透到桌面、键盘收不到）\n\
+                         → 若系统设置已勾选仍显示本行：\n\
+                         1) 核对下方 binary 路径与设置列表条目是否同一 app（旧签名/旧路径条目无效，删除后重加）\n\
+                         2) 完全退出并重启本 app（TCC 不刷新运行中进程的输入监控授权，热升级轮询可能永远等不到）"
+                    },
+                    permission_snapshot()
                 ),
             );
             println!("[input] ✓ CGEventTap created on attempt #{attempt}");
@@ -785,6 +802,7 @@ fn run_worker(app: AppHandle) {
 
             // ===== 分片运行：响应 tap 超时重启 + 输入监控授权后自动升级 =====
             let mut last_perm_check = now_ms();
+            let mut poll_n = 0u32;
             loop {
                 CFRunLoop::run_in_mode(Some(mode), RUN_LOOP_SLICE, true);
                 if needs_restart.swap(false, Ordering::AcqRel) {
@@ -808,14 +826,27 @@ fn run_worker(app: AppHandle) {
                     CGEvent::tap_enable(&tap, true);
                 }
                 // ListenOnly 运行期间持续检查输入监控：一旦用户授权，
-                // 立刻跳出重建为 Default tap（可吞事件），无需重启应用
+                // 立刻跳出重建为 Default tap（可吞事件），无需重启应用。
+                // 每 10s 把权限实时值写诊断日志：用户勾选后若此值恒 false，
+                // 说明 TCC 不刷新运行中进程（需重启 app）或勾选条目不是当前二进制。
                 if !active_tap && now_ms() - last_perm_check >= 2000 {
                     last_perm_check = now_ms();
-                    if listen_event_granted() {
+                    poll_n += 1;
+                    let granted_now = listen_event_granted();
+                    if poll_n % 5 == 0 {
+                        crate::dlog(&format!(
+                            "[input] listen-only poll #{poll_n}: ListenEvent={granted_now} AX={}",
+                            unsafe { AXIsProcessTrusted() }
+                        ));
+                    }
+                    if granted_now {
                         println!("[input] 输入监控已授权 → 重建 Default tap（防穿透生效）");
                         let _ = std::fs::write(
                             "/tmp/wuwatappo-input.log",
-                            "[input] Input Monitoring granted — rebuilding Default tap\n",
+                            format!(
+                                "[input] Input Monitoring granted — rebuilding Default tap\n{}\n",
+                                permission_snapshot()
+                            ),
                         );
                         break;
                     }

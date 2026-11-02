@@ -1382,38 +1382,66 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
 
 **官方链路（正常行为部分）**：panel 内点登录 → 前端 `close_panel_window`（面板消失是**官方设计**）→ `open_login_window`（modalWindows chunk）→ Rust 建 520×440 透明无边框 login 窗口 → login 页动态加载 KrSDK（`kr-sdk.js`）→ `KrSDK.core.openLoginView()` 弹登录浮层。"加入房间"需登录态，未登录时走同一链路。
 
-**故障点**：login 窗口创建了，但用户什么都看不见。日志实锤 `#/login` 加载同秒即抛 `Script error.` 并持续刷屏，说明 **KrSDK 跨域脚本在 `tauri://localhost` 环境下执行报错**，登录浮层未能渲染；透明窗口 + 无内容 = 整窗不可见。
+**故障点**：login 窗口创建了，但用户什么都看不见。11-02 红底诊断实锤：**登录与联机均出现红底** = 窗口存在、可见，但 html/body 之上无任何内容渲染（Vue 登录卡片与 KrSDK 浮层都没出现）。
 
-**已排除**：isdkSrc/isdkCss 已是 `https://` 绝对地址（补丁生效）；`sync_main_layer` 已保证 login 不被 main 盖住；窗口尺寸已适配 500×378 卡片。
+**已排除的假设（勿重蹈）**：
+- ~~KrSDK URL protocol-relative~~：isdkSrc/isdkCss 已是 `https://`（补丁生效）
+- ~~login 被 main 盖住~~：`sync_main_layer` 生效，diag 确认 `login visible=true 520×440`
+- ~~窗口尺寸裁切~~：520×440 容得下 500×378 卡片
+- ~~CORS 拦截~~：**11-02 curl 实测排除**——SDK 真实端点为 `https://sdkapi.kurogame.com/sdkcom/v2/*`（注意 `/v2` 前缀，kr-sdk.js 内 `apiVerison="/v2"` 拼接；不带 /v2 的路径预检 403 "Invalid CORS request" 是 nginx 对未知路径的行为，曾误导诊断）。`/v2` 路径预检返回 `200 + access-control-allow-origin: *`，对包括 `tauri://localhost` 在内的任意 Origin 开放。游戏 API（api-mc-wuwatappo）与遥测（mp-cn-sdklog）则动态回显 Origin。
+- ~~JS 执行错误~~：11-02 运行 app log 零 `onerror`/`unhandledrejection` 记录（对比 10-28 旧构建同场景 2266 次 `Script error.` 刷屏），login 页心跳正常（diag 脚本活着，页面 JS 环境正常）。
 
-**待验证假设（按优先级）**：
-1. **KrSDK 脚本对运行环境的兼容问题**：SDK 可能依赖 cookie/同源 XHR/`document.domain`，在 `tauri://localhost` 自定义协议下第三方 cookie 或 XHR 被 WKWebView 拦截。`Script error.` 无详情，需先让错误可见。
-2. **错误详情不可见是诊断障碍**：script 标签无 `crossorigin="anonymous"`，跨域错误被浏览器脱敏。若 `pro-cdn-sdk.kurogame.com` 返回 CORS 头，给动态 script 加 `crossorigin` 即可拿到真实堆栈。
-3. **红底诊断（e5e6375）尚未跑过**：10-29 运行未点登录。先跑一次红底版确认"窗口在但内容空白" vs "窗口根本不在"。
+**当前嫌疑（按优先级）**：
+1. **UA 残缺**：boot 日志实锤 WKWebView 默认 UA 为 `...AppleWebKit/605.1.15 (KHTML, like Gecko)` ——**缺 `Version/x Safari/x` 段**。KrSDK 内有多处 `navigator.userAgent` 嗅探（getExplorerInfo 风格 browser 检测）；登录 H5 对"不受支持浏览器"静默降级不渲染是常见行为。官方 Windows 版 WebView2 携带完整 Chrome UA。**已修**：辅助窗口统一设置完整 Safari UA（lib.rs `WEBVIEW_UA`）。
+2. **SDK 静默失败**（init 网络请求失败被 catch → console.warn 不落盘）：无 window.onerror 不代表无失败——axios 错误走 Promise 链。**已部署强诊断**：login 窗口注入 `[login-diag]`（on_page_load Finished 时机，早于 SDK 加载）——XHR/fetch 全量 hook（URL/status/网络失败标记）+ 2s/6s/12s 三次 DOM/KrSDK 状态 dump（#app 内容长度、body 子节点、typeof KrSDK、getInitStatus、__KUROJSSDKSTATE__、scripts/styleSheets 清单），一次复现即可定位断点。
+3. WKWebView 磁盘缓存旧 bundle（README §2）：复现前清 `~/Library/Caches/com.kuro.wuwatappo.cn`。
 
-**修复路线**：
+**KrSDK 情报（kr-sdk.js v1.2.3，455KB，preact 渲染）**：
+- 配置：gameId=G152 pkgId=A1476（index-D8GJxFG7.js `isdkConfigs`）
+- API base：`https://sdkapi.kurogame.com/sdkcom` + `/v2`；端点：`/sys/conf.lg`（POST，GET 返回 405）、`/login/accLogin.lg`、`/login/phoneCode.lg`、`/login/getPhoneCode.lg`、`/login/emailPwd.lg`、`/auth/getToken.lg`、`/h5/server/list.lg`、`/h5/role/list.lg`
+- 请求层为 axios（XHR），`openLoginView()` 置 `window.__KUROJSSDKSTATE__.viewType="login"` 后 `show()`（preact DOM 浮层，非 iframe；唯一 iframe 用途是 ThinkingData 埋点的 iOS hack）
+- 埋点域名：mp-cn-sdklog.kurogames.com / sdkdataapi.kurogame.com / ali-sh-datareceiver.kurogame.xyz
+
+**修复路线（更新版）**：
 ```
-① open 启动红底诊断版 → 点登录 → 截图：红底可见=窗口在、内容未渲染（进入②）；无红底=窗口创建/层级问题（查 sync_main_layer/create_aux_window）
-② 给 KrSDK script 注入 crossorigin="anonymous"（前端 patch 或 Rust on_page_load eval）→ 复现 → 从 app log 读真实错误堆栈
-③ 按堆栈定位：CSP/cookie/XHR/域名白名单 → 对症处理（tauri.conf.json csp 当前为 null 不拦截；重点是 WKWebView 第三方存储分区 ITP 对 SDK cookie 的影响）
-④ 备选：将 kr-sdk.js/style.css 本地化进 dist（同源加载，消除跨域与 ITP 问题；需验证 SDK 是否有同源检测）
-⑤ 根因修复后移除红底诊断代码
+① 已实施：辅助窗口完整 Safari UA + [login-diag] 强诊断注入 → 重编译（固定证书）
+② 用户复现：清 WebKit 缓存 → open 启动 → 点登录 → 收集 app log 的 [login-diag] 行
+③ 若 UA 修复生效（浮层出现）→ 移除红底诊断，收尾
+④ 若仍红底 → 按 [login-diag] 分流：
+   - KrSDK=undefined → 脚本未加载（查 scripts 清单/网络）
+   - init=false + XHR 失败记录 → 按失败请求对症（UA/referer/参数）
+   - init=true + 浮层未渲染 → dump body 子节点查 preact 挂载点/CSS
+⑤ 根因修复后移除红底诊断代码（lib.rs open_login_window）
 ```
 
 ### 11.2 BUG 2：应用未聚焦时键盘不计数
 
 **根因已锁定（非代码 bug，是权限态）**：`tap mode = listen-only`。macOS 10.15+ 的 TCC 将「监听键盘」归入**输入监控（Input Monitoring / kTCCServiceListenEvent）**权限；仅有「辅助功能」时 ListenOnly tap 收不到 KeyDown/KeyUp。窗口聚焦时计数走 WKWebView 原生 keydown，所以"聚焦正常、失焦失效"。
 
-**代码已具备的能力**：启动时 `CGPreflightListenEventAccess` 检测 → 未授权自动打开系统设置「输入监控」面板 + `CGRequestListenEventAccess()` 弹系统授权框 → ListenOnly 运行期间每 2s 轮询，授权后**热升级重建 Default tap**（无需重启）。
+**⚠️ 11-02 新情况：用户已在系统设置勾选输入监控，但 11:43 重启后的运行仍是 listen-only**（`/tmp/wuwatappo-input.log` 写入时间 11:43 实锤）。三种可能：
+1. **勾选的条目不是当前二进制**：TCC 列表可能存在多条 WuwaTappo（adhoc 时代累积的旧签名条目、不同路径的副本）。当前运行的二进制路径以 input.log 新增的 `binary =` 行为准。
+2. **TCC 不刷新运行中进程的 ListenEvent 授权**：Apple 对 kTCCServiceListenEvent 的已知行为——授权后目标 app 必须重启；代码内 2s 热升级轮询（`CGPreflightListenEventAccess`）可能对运行中进程恒返回旧值。若勾选发生在 11:43 运行期间，则属此类，重启即愈。
+3. TCC 记录损坏：`tccutil reset ListenEvent com.kuro.wuwatappo.cn` 清空后重新走系统弹窗授权。
 
-**为什么用户仍处于 listen-only**：10-29 运行日志显示权限仍未授予——可能用户未在系统设置勾选「输入监控」（弹窗易被忽略），或此前 adhoc 签名时代授权已失效（现已换固定证书，重新授权一次即可持久）。
+**已部署诊断增强（input.rs）**：
+- tap 建立时 input.log 写入 `binary = <当前二进制绝对路径>` + `AXIsProcessTrusted` + `CGPreflightListenEventAccess` 实时值
+- listen-only 轮询每 10s 向 `/tmp/wuwatappo-diag.log` 写一行 `listen-only poll #N: ListenEvent=? AX=?`——勾选后观察此值是否翻转，直接区分可能性 1/2
 
-**修复路线**：
+**标准重置流程（推荐给用户执行）**：
+```bash
+# 1. 杀掉 app
+pkill -9 -f wuwatappo
+# 2. 清空两类 TCC 记录（会同时清掉旧签名的僵尸条目）
+tccutil reset ListenEvent com.kuro.wuwatappo.cn
+tccutil reset Accessibility com.kuro.wuwatappo.cn
+# 3. 系统设置 → 隐私与安全性 → 辅助功能/输入监控：手动删除残留的 WuwaTappo 条目
+# 4. 启动新版 app（系统弹窗授权 → 允许；若没弹窗则手动勾选，注意核对条目路径）
+open src-tauri/target/release/bundle/macos/WuwaTappo.app
+# 5. 验证
+cat /tmp/wuwatappo-input.log   # 期望 tap mode = default/swallow
 ```
-① 系统设置 → 隐私与安全性 → 输入监控 → 勾选 WuwaTappo（固定证书签名后授权跨编译保持）
-② 验证 /tmp/wuwatappo-input.log 变为 "tap mode = default/swallow"
-③ 产品化改进（可选）：listen-only 时前端弹 toast 明确提示"需要输入监控权限"，而非静默降级——当前只有 /tmp 日志和一闪而过的系统设置窗口，用户几乎必然忽略
-```
+
+**产品化改进（待办）**：listen-only 时前端弹 toast 明确提示"需要输入监控权限，授权后请重启应用"，而非静默降级——当前只有 /tmp 日志和一闪而过的系统设置窗口，用户几乎必然忽略。
 
 ### 11.3 BUG 3：桌宠拖动/点击互动时常失效
 
