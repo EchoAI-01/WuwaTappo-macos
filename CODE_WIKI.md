@@ -66,6 +66,7 @@
 
 | 文件 | 补丁 | 原因 |
 |------|------|------|
+| `index.html` | `<head>` 注入 **document.cookie shim**（localStorage 后端，内联 script，先于所有 bundle 执行） | WKWebView 在 `tauri://localhost` 自定义 scheme 下禁用 `document.cookie`（WebKit 非 http(s) origin 限制）；官方前端登录态 = `kuro_infoToken`/`kuro_lastLoginTime` cookie（`applyAuthTokens`/`renewTokenIfNeeded` 链路），不禁用会导致"登录 API 成功但应用始终未登录"。shim 先探测原生 cookie，可用则不动 |
 | `assets/index-D8GJxFG7.js` | 应用显示文案 | 应用名适配 |
 | | `isdkSrc` / `isdkCss` 由 `//pro-cdn-sdk.kurogame.com/...` 改为 `https://...` | protocol-relative URL 在 `tauri://localhost` 下解析失败，KuroSDK 加载不了，登录窗口空白（Windows 的 `https://tauri.localhost` 不受影响） |
 | `assets/index-DmC0wUEw.js` | `key-press` 监听注册后追加 `notify_input_bridge_ready()` 注入 | 输入桥握手观测点（见踩坑 §3） |
@@ -1406,7 +1407,23 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
 
 **事件契约（modalBridge-DrPKsAwT.js + 官方 exe 字符串表双重实锤）**：login 页前端 `listenLoginModalOpen` 监听 **`login-modal-open`** 事件，收到后才调 `openLoginView()`。官方 Rust 壳在 login 窗口就绪后 emit 该事件（exe 字符串表存在 `login-modal-open`，与 `cat-force-update-lock`、`cat-native-network-status-changed` 等官方事件名相邻）。重建壳的 `open_login_window` 只建窗口、从未 emit → 链路断在最后一环。
 
-**修复（已实施）**：`on_page_load`（login 窗口 Finished）后 spawn 线程延时连发三次 `emit_to("login", "login-modal-open", {})`（0.8s/2.3s/5.3s，覆盖 Vue 监听注册时序；前端 openLoginView 有 T 计数防并发、show() 幂等）。
+**修复（已实施，11-02 两轮迭代）**：
+1. 第一轮：`on_page_load`（login Finished）后 spawn 线程延时连发三次 `emit_to("login", "login-modal-open", {})` → **实测浮层成功渲染**（`DIV.login-select-popup` 登录选择弹层出现，用户确认"联机和宝箱弹出登录框"），根因确认。
+2. 第二轮（intent 语义修正）：login chunk 回调实为 `r?.intent==="show" ? K() : n()`——`K()`→`ze()` 检查**外服**角色信息（CN 场景恒 false，什么都不做）；**`n()` 才是国服登录路径**（等 SDK ready → 弹浮层）。固定发 `"show"` 会破坏国服登录，正确做法是**透传 `open_login_window` 的 intent 参数**（login 按钮="login"、联机="room"，经 `LoginIntent` state 中转到 on_page_load）；窗口已存在的重显场景（show/focus 不重新触发 on_page_load）则直接补发 `{"intent":"show"}`。
+
+**login 窗口自动关闭机制（逆向确认，勿误诊为 bug）**：login 页 setup 注册了多个关闭触发器——`cat-auth-login-success`（Tauri 事件 + DOM 事件双通道，登录成功即关窗）、`cat-login-overlay {open:false}`（浮层关闭 → 120ms 延时 `closeLoginWindow`）、`cat-pass-login-overlay` DOM 事件同理。因此"窗口开了又很快自己关"通常是登录成功或浮层被关闭的正常链路。
+
+**遗留问题 → 根因已锁定（11-02 实测 + 代码逆向）**：用户完成登录操作，`POST /api/auth/login → 200 len=190` + `/api/auth/player/query → 200` 均成功发出，但**应用仍显示未登录**。
+
+**根因：登录态 cookie 在 `tauri://localhost` 下不可用**。逆向 `index-D8GJxFG7.js` 确认：
+- 登录成功后 `applyAuthTokens()` → `setCookie("infoToken", token, days)` + `setCookie("lastLoginTime", ...)`（cookie 名前缀 `kuro_`）
+- `getCookie`/`setCookie` 为**纯 `document.cookie` 实现**
+- 会话维持/token 刷新链 `renewTokenBeforeRequest`/`shouldRenewToken` 全部读这些 cookie
+- WKWebView 对自定义 scheme（非 http(s)）origin 禁用 `document.cookie`（写入静默失败、读取恒空）→ `kuro_infoToken` 永远写不进 → 应用恒判未登录。Windows 官方版 origin 是 `http://tauri.localhost`（http scheme），cookie 正常，无此问题。
+
+**修复（已实施）**：`index.html` `<head>` 注入内联 **cookie shim**（先于所有 bundle 执行）——探测原生 cookie，可用则不动；不可用则以 `localStorage.__kuro_cookie_shim__` 为后端 `Object.defineProperty(Document.prototype,'cookie')` 等价模拟（支持 expires/max-age/删除；localStorage 同源跨窗口共享 = login 窗口写、main/panel 窗口读，与原生 cookie 语义一致；持久化跨重启）。[login-diag] dump 同步输出 `cookie[rw=/shim=/infoToken=]` 状态供验证。
+
+**红底诊断代码已移除**（e5e6375 注入的红色背景完成使命；用户所见"大红方块"即该诊断底色透出浮层背后）。
 
 **关联事件契约（modalBridge 全量，供后续对齐）**：
 | 事件 | 方向 | 用途 |

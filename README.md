@@ -121,6 +121,7 @@ WKWebView 会对"无活动"页面执行 **idle 挂起**（JS 冻结、timer 停�
 
 | 文件 | 补丁 | 原因 |
 |---|---|---|
+| `index.html` | `<head>` 注入 document.cookie shim（localStorage 后端） | WKWebView 在 `tauri://localhost` 下禁用 `document.cookie`，而官方前端登录态存于 `kuro_infoToken` cookie——不禁用会导致"登录成功但应用仍显示未登录"（Windows 的 `http://tauri.localhost` 不受影响） |
 | `assets/index-D8GJxFG7.js` | 应用显示文案 | 应用名适配 |
 | | `isdkSrc` / `isdkCss` 由 `//pro-cdn-sdk.kurogame.com/...` 改为 `https://...` | protocol-relative URL 在 `tauri://localhost` 下解析失败，KrSDK 加载不了，登录窗口空白（Windows 的 `https://tauri.localhost` 不受影响） |
 | `assets/index-DmC0wUEw.js` | `key-press` 监听注册后追加 `notify_input_bridge_ready()` 注入 | 输入桥握手观测点（见踩坑 §3） |

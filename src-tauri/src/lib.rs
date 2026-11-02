@@ -812,20 +812,27 @@ fn open_login_window<R: Runtime>(
     intent: Option<String>,
     compact: Option<bool>,
 ) -> Result<(), String> {
-    dlog("[cmd] open_login_window");
-    let _ = (intent, compact);
+    dlog(&format!("[cmd] open_login_window intent={intent:?} compact={compact:?}"));
+    let _ = compact;
+    // 记录 intent：login 窗口 PageLoad 后补发 login-modal-open 时透传给前端
+    // （前端回调 r?.intent==="show" 走外服重显分支，其余走国服展示浮层分支）
+    if let Some(st) = app.try_state::<LoginIntent>() {
+        *st.0.lock().unwrap() = intent.clone().unwrap_or_else(|| "login".into());
+    }
     // 前端 login 卡片固定 500x378（login-CBA3ItgU.css），窗口必须容得下，
     // 之前给 400x620 会把卡片右边裁掉 100px
+    let existed = app.get_webview_window("login").is_some();
     create_aux_window(&app, "login", "/login", "WuwaTappo", 520.0, 440.0, false)
         .map_err(|e| e.to_string())?;
-    // 诊断：窗口若可见但内容全透明，用户会看不到任何东西。
-    // 这里注入一个高对比底色，用于区分"窗口不在"还是"内容没渲染"。
-    if let Some(win) = app.get_webview_window("login") {
-        let _ = win.eval(
-            "document.documentElement.style.setProperty('background','#ff0000','important');\
-             document.body.style.setProperty('background','#ff0000','important');",
+    if existed {
+        // 窗口已存在：show/focus 不会重新触发 on_page_load，监听早已注册，
+        // 直接补发 intent="show"（前端 K() 重显分支：CN 场景维持既有浮层）
+        let _ = app.emit_to(
+            "login",
+            "login-modal-open",
+            serde_json::json!({ "intent": "show" }),
         );
-        dlog("[login] diag: injected red background");
+        dlog("[login] window existed, emitted login-modal-open (intent=show)");
     }
     Ok(())
 }
@@ -1049,6 +1056,11 @@ fn save_cumulative_click_count<R: Runtime>(
 /// 避免高频事件轰炸未就绪的 IPC 通道（曾导致监听注册竞态失败）。
 pub struct InputBridgeReady(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
 
+/// open_login_window 的 intent 参数暂存：login 窗口 PageLoad 后补发
+/// login-modal-open 事件时透传（前端回调按 intent 分流："show"=外服重显，
+/// 其余=国服展示登录浮层）。on_page_load 拿不到命令参数，经 State 中转。
+pub struct LoginIntent(pub Mutex<String>);
+
 #[tauri::command]
 fn notify_input_bridge_ready<R: Runtime>(app: AppHandle<R>) {
     dlog("[cmd] notify_input_bridge_ready");
@@ -1218,6 +1230,7 @@ pub fn run() {
             app.manage(InputBridgeReady(std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             )));
+            app.manage(LoginIntent(Mutex::new("login".into())));
 
             // 托盘
             let _tray = TrayIconBuilder::with_id("main-tray")
@@ -1368,13 +1381,19 @@ pub fn run() {
   // 只记录外部网络请求；ipc://localhost 是 Tauri 内部命令通道（Rust 侧已有
   // [cmd] 日志），且 write_app_log 本身走 fetch ipc —— 记录它会自我循环刷屏。
   function ext(u){ return String(u).indexOf('ipc://localhost') !== 0; }
+  // 登录链路关键请求：额外记录响应体（auth/login 返回 200 但登录态不生效，
+  // 需要看业务 code/message 才能定位）
+  function key(u){ u = String(u); return u.indexOf('/api/auth/') !== -1 || u.indexOf('sdkapi.kurogame.com') !== -1; }
   // XHR hook
   var XO = XMLHttpRequest.prototype.open, XS = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function(m, u){ this.__d = m + ' ' + u; this.__ext = ext(u); return XO.apply(this, arguments); };
+  XMLHttpRequest.prototype.open = function(m, u){ this.__d = m + ' ' + u; this.__ext = ext(u); this.__key = key(u); return XO.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function(b){
     var x = this;
     if (x.__ext) x.addEventListener('loadend', function(){
-      w('XHR ' + x.__d + ' -> ' + x.status + (x.status === 0 ? ' (NETWORK FAIL/CORS)' : ' len=' + String(x.responseText || '').length));
+      var body = '';
+      if (x.__key) { try { body = ' RESP=' + String(x.responseText || '').slice(0, 300); } catch(e){}
+        try { body += ' REQ=' + String(b || '').slice(0, 200); } catch(e){} }
+      w('XHR ' + x.__d + ' -> ' + x.status + (x.status === 0 ? ' (NETWORK FAIL/CORS)' : ' len=' + String(x.responseText || '').length) + body);
     });
     return XS.apply(this, arguments);
   };
@@ -1384,8 +1403,12 @@ pub fn run() {
     window.fetch = function(u, o){
       var url = typeof u === 'string' ? u : (u && u.url);
       if (!ext(url)) return F.apply(this, arguments);
-      return F.apply(this, arguments).then(function(r){ w('fetch ' + url + ' -> ' + r.status); return r; },
-        function(e){ w('fetch ' + url + ' -> FAIL ' + e); throw e; });
+      var isKey = key(url);
+      return F.apply(this, arguments).then(function(r){
+        if (isKey) { try { r.clone().text().then(function(t){ w('fetch* ' + url + ' -> ' + r.status + ' RESP=' + t.slice(0, 300)); }); } catch(e){ w('fetch ' + url + ' -> ' + r.status); } }
+        else w('fetch ' + url + ' -> ' + r.status);
+        return r;
+      }, function(e){ w('fetch ' + url + ' -> FAIL ' + e); throw e; });
     };
   }
   // 延时 DOM/SDK 状态 dump
@@ -1401,11 +1424,20 @@ pub fn run() {
       var initSt = 'n/a';
       try { initSt = String(window.KrSDK && window.KrSDK.core && window.KrSDK.core.getInitStatus && window.KrSDK.core.getInitStatus()); } catch(e){}
       var scripts = [].map.call(document.scripts, function(s){ return s.src ? s.src.slice(-40) : 'inline'; }).join(',');
+      var ck = 'n/a';
+      try {
+        document.cookie = '__diag_probe=1';
+        var rw = document.cookie.indexOf('__diag_probe=1') !== -1;
+        document.cookie = '__diag_probe=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+        ck = 'rw=' + rw + ' shim=' + (localStorage.getItem('__kuro_cookie_shim__') ? 'stored' : 'empty') +
+          ' infoToken=' + (document.cookie.indexOf('kuro_infoToken=') !== -1);
+      } catch(e){ ck = 'err:' + e; }
       w('dump[' + tag + '] appHTML=' + (app ? app.innerHTML.length + '{' + app.innerHTML.slice(0, 100) + '}' : 'NO#APP') +
         ' sdkDiv=' + (sdkDiv ? sdkDiv.innerHTML.length + '{' + sdkDiv.innerHTML.slice(0, 150) + '}' : 'none') +
         ' bodyKids={' + kids + '}' +
         ' KrSDK=' + typeof window.KrSDK + ' init=' + initSt +
         ' sdkState=' + String(sdkState).slice(0, 250) +
+        ' cookie[' + ck + ']' +
         ' stylesheets=' + document.styleSheets.length +
         ' scripts=[' + scripts + ']');
     } catch(e){ w('dump[' + tag + '] failed: ' + e); }
@@ -1419,13 +1451,21 @@ pub fn run() {
                     dlog("[login] strong diagnostics injected");
                     // ===== BUG 1 根因修复：补发官方 login-modal-open 事件 =====
                     // modalBridge chunk 实锤：login 页前端 listenLoginModalOpen
-                    // 监听 "login-modal-open"，收到后才调 KrSDK.core.openLoginView()
-                    // 弹登录浮层（官方 exe 字符串表存在该事件名）。重建壳此前漏发
-                    // → SDK 加载+init 成功但浮层永不弹（__KUROJSSDKSTATE__ 无
-                    // viewType、#app 空渲染、前端反复重试 open_login_window）
-                    // → 透明窗口整窗不可见（"点了登录什么都没发生"/只见红底）。
+                    // 监听 "login-modal-open"，收到后才展示登录 UI（官方 exe
+                    // 字符串表存在该事件名）。重建壳此前漏发 → SDK 加载+init
+                    // 成功但浮层永不弹 → 透明窗口整窗不可见。
+                    // payload 透传 open_login_window 的 intent（经 LoginIntent
+                    // state 中转）：前端回调 r?.intent==="show" 走外服重显分支
+                    // K()，其余（login/room 等）走国服 n() → 等 SDK ready →
+                    // 弹登录浮层。不能发固定 "show"（CN 场景 K() 的 ze() 检查
+                    // 外服信息恒 false，等于什么都不做）。
                     // Vue 监听注册晚于 PageLoad Finished，延时连发三次防错过
                     // （前端 openLoginView 有 T 计数防并发、show() 幂等）。
+                    let intent = webview
+                        .app_handle()
+                        .try_state::<LoginIntent>()
+                        .map(|st| st.0.lock().unwrap().clone())
+                        .unwrap_or_else(|| "login".into());
                     let app2 = webview.app_handle().clone();
                     std::thread::spawn(move || {
                         for delay_ms in [800u64, 1500, 3000] {
@@ -1436,9 +1476,9 @@ pub fn run() {
                             let _ = app2.emit_to(
                                 "login",
                                 "login-modal-open",
-                                serde_json::json!({}),
+                                serde_json::json!({ "intent": intent }),
                             );
-                            dlog("[login] emitted login-modal-open");
+                            dlog(&format!("[login] emitted login-modal-open (intent={intent})"));
                         }
                     });
                 }

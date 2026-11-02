@@ -5,6 +5,61 @@
     <link rel="icon" type="image/png" href="./favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>WuwaTappo</title>
+    <script>
+      // ===== macOS 移植补丁：document.cookie shim（localStorage 后端）=====
+      // WKWebView 在 tauri://localhost 自定义 scheme 下禁用 document.cookie
+      // （WebKit 对非 http(s) origin 的限制；Windows 版 http://tauri.localhost
+      // 不受影响）。官方前端登录态 = kuro_infoToken / kuro_lastLoginTime
+      // cookie（applyAuthTokens/renewTokenIfNeeded 链路），cookie 不可用会
+      // 导致"登录 API 成功但应用始终未登录"。
+      // 此 shim 在任何 bundle 执行前探测原生 cookie：可用则不动；不可用则
+      // 用 localStorage 等价模拟（同源跨窗口共享、持久化、支持 expires/max-age）。
+      (function () {
+        try {
+          document.cookie = "__probe__=1";
+          if (document.cookie.indexOf("__probe__=1") !== -1) {
+            document.cookie = "__probe__=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+            return; // 原生 cookie 可用，无需 shim
+          }
+        } catch (e) { /* 探测失败 → 走 shim */ }
+        var KEY = "__kuro_cookie_shim__";
+        function load() { try { return JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { return {}; } }
+        function save(o) { try { localStorage.setItem(KEY, JSON.stringify(o)); } catch (e) {} }
+        try {
+          Object.defineProperty(Document.prototype, "cookie", {
+            configurable: true,
+            enumerable: true,
+            get: function () {
+              var s = load(), out = [], n = Date.now();
+              for (var k in s) { if (!s[k].exp || s[k].exp >= n) out.push(k + "=" + s[k].v); }
+              return out.join("; ");
+            },
+            set: function (str) {
+              var s = load();
+              var parts = String(str).split(";");
+              var kv = parts[0];
+              var i = kv.indexOf("=");
+              if (i > -1) {
+                var name = kv.slice(0, i).trim();
+                var val = kv.slice(i + 1).trim();
+                var exp = 0;
+                for (var j = 1; j < parts.length; j++) {
+                  var p = parts[j].trim();
+                  if (/^expires=/i.test(p)) { var d = Date.parse(p.slice(8)); if (!isNaN(d)) exp = d; }
+                  else if (/^max-age=/i.test(p)) { var ma = parseInt(p.slice(8), 10); if (!isNaN(ma)) exp = Date.now() + ma * 1000; }
+                }
+                if (exp && exp < Date.now()) { delete s[name]; } else { s[name] = { v: val, exp: exp }; }
+                save(s);
+              }
+            }
+          });
+          var s = load(), n = Date.now(), changed = false;
+          for (var k in s) { if (s[k].exp && s[k].exp < n) { delete s[k]; changed = true; } }
+          if (changed) save(s);
+          console.info("[cookie-shim] active (localStorage backend)");
+        } catch (e) { console.error("[cookie-shim] install failed", e); }
+      })();
+    </script>
     <style>
       html,
       body,
