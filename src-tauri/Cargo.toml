@@ -43,6 +43,6 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
-# 发布匿名化：编译机绝对路径（/Users/<name>/...）经构建脚本 RUSTFLAGS
-# -C remap-path-prefix 重映射为虚拟前缀（见 .cargo/config.toml），
+# 发布匿名化：编译机绝对路径（/Users/<name>/...）经构建时环境变量 RUSTFLAGS
+# 的顶层 flag --remap-path-prefix 重映射为虚拟前缀（见 README「构建与打包」），
 # 避免分发二进制泄露打包者用户名/目录结构

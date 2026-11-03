@@ -1,10 +1,10 @@
 # WuwaTappo-macos Code Wiki
 
 > 鸣潮桌宠 macOS 移植版 — 社区逆向重建壳  
-> 仓库版本：v0.0.1-Beta | Tauri 2.10.3 | Rust Edition 2021  
-> 官方前端资产版本：1.0.1（`Cargo.toml`/`tauri.conf.json` 中的版本号沿袭官方 exe 资产，便于对应官方功能集）  
+> 仓库版本：1.0.3-beta（跟随官方 1.0.3 前端资产；beta = 社区移植测试版） | Tauri 2.10.3 | Rust Edition 2021  
+> 官方前端资产版本：1.0.3（`Cargo.toml`/`tauri.conf.json` 版本号与官方 exe 资产对齐；历史版本 1.0.1-beta / v0.0.1-Beta）  
 > 仓库：https://github.com/EchoAI-01/WuwaTappo-macos  
-> 文档更新：2026-11-02（全量代码 Review 同步：行号快照刷新至 lib.rs 1403 行 / input.rs 864 行；新增 §11 三大 BUG 现场诊断与修复路线；记录 login 红底临时诊断代码与签名/产物现状）
+> 文档更新：2026-11-02（1.0.3 全量同步：行号快照刷新至 lib.rs 1698 行 / input.rs 921 行 / fullscreen.rs 118 行 / ws_proxy.rs 134 行；新增游戏模式（CGWindowList 全屏检测）、自定义快捷键系统（F7/F8/F9）、房间 socket.io 本地中继代理；登录强诊断已在发布版剥离；升级实施细节见 §12）
 
 ---
 
@@ -23,6 +23,9 @@
   - [4.4 托盘与右键菜单系统](#44-托盘与右键菜单系统)
   - [4.5 前端-后端命令桥（Invoke Handlers）](#45-前端-后端命令桥invoke-handlers)
   - [4.6 本地存储层](#46-本地存储层)
+  - [4.7 房间 socket.io 本地中继代理 (ws_proxy.rs，1.0.1-beta)](#47-房间-socketio-本地中继代理-ws_proxyrs101-beta)
+  - [4.8 前台全屏检测 (fullscreen.rs，1.0.3 游戏模式数据源)](#48-前台全屏检测-fullscreenrs103-游戏模式数据源)
+  - [4.9 自定义快捷键系统 (lib.rs + input.rs，1.0.3)](#49-自定义快捷键系统-librs--inputrs103)
 - [5. 关键类、结构体与函数索引](#5-关键类结构体与函数索引)
 - [6. 依赖关系详解](#6-依赖关系详解)
 - [7. 配置文件说明](#7-配置文件说明)
@@ -35,6 +38,7 @@
   - [9.5 源码中的 no-op 命令](#95-源码中的-no-op-命令)
 - [10. 事件协议参考](#10-事件协议参考)
 - [11. 当前 BUG 现场诊断与修复路线（2026-11-02）](#11-当前-bug-现场诊断与修复路线2026-11-02)
+- [12. 1.0.3 升级实施（2026-11-02）](#12-103-升级实施2026-11-02)
 
 ---
 
@@ -42,7 +46,7 @@
 
 **WuwaTappo-macos** 是库洛游戏（Kuro Games）旗下《鸣潮》（Wuthering Waves）桌宠应用 **WuwaTappo** 的 macOS 社区移植版。
 
-官方只发布了 Windows 版（exe），本项目通过逆向 `WuwaTappo-cn_1.0.1_x64-setup.exe`，**完整复用官方前端 dist 与云端协议，为 macOS 重建原生外壳**，让 Mac 用户也能使用鸣潮桌宠，并与 Windows exe 端玩家正常联机互动。
+官方只发布了 Windows 版（exe），本项目通过逆向官方安装包（首版 `WuwaTappo-cn_1.0.1_x64-setup.exe`；1.0.3 起官方 setup 无 NSIS 二层，资产改从内嵌 PE 的 .rdata brotli 提取，见 §12.3），**完整复用官方前端 dist 与云端协议，为 macOS 重建原生外壳**，让 Mac 用户也能使用鸣潮桌宠，并与 Windows exe 端玩家正常联机互动。当前版本对齐官方 **1.0.3** 前端资产。
 
 ### 移植策略（为什么是"复用前端 + 重建壳"）
 
@@ -54,23 +58,23 @@
 
 ### 逆向工作流
 
-1. `7zz` 双层解开 Tauri 安装壳 + 内嵌 NSIS 包，取出 `WuwaTappo.exe`（77.9 MB）与前端 dist；
-2. 分析未 strip 的 Rust 符号，还原 **50 个自定义 invoke 命令** 与窗口模型；
-3. 实测官方协议链路（配置发现 → 资源 CDN → 登录 → 玩法 API），确认 macOS 可直连；
+1. `7zz` 双层解开 Tauri 安装壳 + 内嵌 NSIS 包（1.0.1），取出 `WuwaTappo.exe`（77.9 MB）与前端 dist；1.0.3 改为 PE .rdata brotli 提取（§12.3）；
+2. 分析未 strip 的 Rust 符号，还原 **53 个自定义 invoke 命令**（1.0.1 为 50 个，1.0.3 新增快捷键 3 个）与窗口模型；
+3. 实测官方协议链路（配置发现 → 资源 CDN → 登录 → 玩法 API → 房间 socket.io），确认 macOS 可直连（房间长连接需本地中继代理，见 §4.7）；
 4. 为 macOS 重建壳（本仓库 `src-tauri/`），对齐官方关键架构决策（全屏 shell 恒穿透 + 输入事件桥）；
 5. 对官方前端 dist 做**最小限度补丁**（见下表），其余字节不动。
 
 ### 前端补丁清单（对官方 dist 的全部修改）
 
-官方 dist 除以下补丁外字节不动：
+官方 dist（当前基于 **1.0.3**，主 bundle `index-CuzHFfJW.js`）除以下补丁外字节不动：
 
 | 文件 | 补丁 | 原因 |
 |------|------|------|
-| `index.html` | `<head>` 注入 **document.cookie shim**（localStorage 后端，内联 script，先于所有 bundle 执行） | WKWebView 在 `tauri://localhost` 自定义 scheme 下禁用 `document.cookie`（WebKit 非 http(s) origin 限制）；官方前端登录态 = `kuro_infoToken`/`kuro_lastLoginTime` cookie（`applyAuthTokens`/`renewTokenIfNeeded` 链路），不禁用会导致"登录 API 成功但应用始终未登录"。shim 先探测原生 cookie，可用则不动 |
-| `assets/index-D8GJxFG7.js` | 应用显示文案 | 应用名适配 |
-| | `isdkSrc` / `isdkCss` 由 `//pro-cdn-sdk.kurogame.com/...` 改为 `https://...` | protocol-relative URL 在 `tauri://localhost` 下解析失败，KuroSDK 加载不了，登录窗口空白（Windows 的 `https://tauri.localhost` 不受影响） |
-| `assets/index-DmC0wUEw.js` | `key-press` 监听注册后追加 `notify_input_bridge_ready()` 注入 | 输入桥握手观测点（见踩坑 §3） |
-| `assets/index-DenkafYz.js` | 文案适配 | 同应用名适配 |
+| `index.html` | `<head>` 注入 **document.cookie shim**（localStorage 后端，内联 script，先于所有 bundle 执行）；主 bundle/CSS 的 hash 引用随版本更新 | WKWebView 在 `tauri://localhost` 自定义 scheme 下禁用 `document.cookie`（WebKit 非 http(s) origin 限制）；官方前端登录态 = `kuro_infoToken`/`kuro_lastLoginTime` cookie（`applyAuthTokens`/`renewTokenIfNeeded` 链路），不打补丁会导致"登录 API 成功但应用始终未登录"。shim 先探测原生 cookie，可用则不动 |
+| 全部 `assets/*.js` | 显示名 `"Wuwa Tappo"` → `"WuwaTappo"`（1.0.3 共 102 处） | 应用名统一（与产品名/托盘一致） |
+| `assets/index-CuzHFfJW.js`（主 bundle；1.0.1 名 `index-D8GJxFG7.js`） | `isdkSrc` / `isdkCss` 由 `//pro-cdn-sdk.kurogame.com/...` 改为 `https://...` | protocol-relative URL 在 `tauri://localhost` 下解析失败，KuroSDK 加载不了，登录窗口空白（Windows 的 `https://tauri.localhost` 不受影响） |
+| `assets/index-pp8VWaUF.js`（房间/panel chunk；1.0.1 名 `index-DmC0wUEw.js`） | `key-press` 监听注册后追加 `__TAURI_INTERNALS__.invoke("notify_input_bridge_ready")` 注入（1.0.3 改用 internals 直呼，不依赖 chunk 内包装符号） | 输入桥握手观测点（见踩坑 §3） |
+| 同上 | `ey()`（1.0.1 名 `Ig()`）默认 socket 地址由 `https://api-mc-wuwatappo.kurogames-global.com` 改为 `http://127.0.0.1:17321`（本地代理） | 房间 socket.io 服务端 Origin 白名单拒绝 `tauri://localhost`（403），代理外发时重写为官方值（见 §4.7） |
 
 ### 设计目标
 
@@ -85,8 +89,8 @@
 
 | 属性 | 值 |
 |------|-----|
-| 仓库版本 | v0.0.1-Beta |
-| 官方前端资产版本 | 1.0.1（沿袭官方 exe，便于对应官方功能集） |
+| 仓库版本 | 1.0.3-beta（`Cargo.toml` version；历史：1.0.1-beta、v0.0.1-Beta） |
+| 官方前端资产版本 | 1.0.3（与官方 exe 资产对齐；1.0.3 新增游戏模式/自定义快捷键/登录窗拖拽，见 §12） |
 | 包名 | `wuwatappo-macos` |
 | 产物名 | `WuwaTappo.app` |
 | Bundle ID | `com.kuro.wuwatappo.cn` |
@@ -110,7 +114,7 @@
 ├──────────────────────────┬──────────────────────────────────────┤
 │     前端层 (WASM/JS)      │            原生层 (Rust)             │
 ├──────────────────────────┼──────────────────────────────────────┤
-│ 官方 Vue SPA dist         │  Tauri Runtime (tauri ^2.10.3)      │
+│ 官方 Vue SPA dist 1.0.3   │  Tauri Runtime (tauri ^2.10.3)      │
 │ （编译期嵌入二进制）       │  CGEventTap (objc2-core-graphics)    │
 │ WKWebView 渲染引擎        │  NSMenu / Tray Icon (Muda)          │
 │ Hash 路由: #/桌宠         │  窗口管理 (WebviewWindowBuilder)    │
@@ -119,10 +123,14 @@
 │            #/update       │  文件对话框 (tauri-plugin-dialog)   │
 │            #/about        │  深度链接 (tauri-plugin-deep-link)  │
 │            #/oss-notice   │  keep-alive 线程（防 idle 挂起）      │
+│                           │  fullscreen.rs 全屏检测（游戏模式）   │
+│                           │  ws_proxy.rs 房间 WS 中继（:17321）  │
+│                           │  自定义快捷键（F7/F8/F9 匹配触发）    │
+│                           │  tokio + tokio-tungstenite（WS 代理）│
 ├──────────────────────────┴──────────────────────────────────────┤
 │                     系统 API 层                                  │
 ├─────────────────────────────────────────────────────────────────┤
-│  CoreGraphics (CGEventTap) │ CoreFoundation (CFRunLoop)         │
+│  CoreGraphics (CGEventTap / CGWindowList) │ CoreFoundation      │
 │  ApplicationServices (辅助功能授权) │ LaunchServices (LaunchAgent)│
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -141,6 +149,7 @@
 │  鼠标移动 ──▶ CGEventTap ──▶ mouse-move ──▶ 桌宠动画               │
 │  键盘敲击 ──▶ CGEventTap ──▶ key-press   ──▶ 打字计数             │
 │  鼠标点击 ──▶ CGEventTap ──▶ mouse-button ──▶ 点击/拖拽判定         │
+│  F7/F8/F9 ──▶ CGEventTap ──▶ app-shortcut ──▶ 游戏模式/切屏/显隐  │
 └─────────────────────────────────────────────────────────────────────┘
                                 │
                                 ▼
@@ -179,22 +188,27 @@
                                 │ Tauri IPC (JSON)
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                   Rust 命令处理器 (lib.rs)                          │
+│                Rust 命令处理器 (lib.rs) + 平台模块                   │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
-│  │ 50 个命令 │ │ 窗口管理  │ │ 托盘菜单  │ │ 本地存储  │ │ 更新/日志 │  │
+│  │ 53 个命令 │ │ 窗口管理  │ │ 托盘菜单  │ │ 本地存储  │ │ 更新/日志 │  │
 │  │ (按官方   │ │           │ │           │ │           │ │          │  │
 │  │  签名1:1 │ │           │ │           │ │           │ │          │  │
 │  │  重建)    │ │           │ │           │ │           │ │          │  │
 │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘  │
+│  ┌────────────────┐ ┌──────────────────┐ ┌───────────────────────┐  │
+│  │ 快捷键系统      │ │ fullscreen.rs    │ │ ws_proxy.rs           │  │
+│  │ get/set/       │ │ CGWindowList     │ │ 127.0.0.1:17321      │  │
+│  │ capture 3 命令 │ │ 全屏检测→游戏模式 │ │ socket.io Origin 改写 │  │
+│  └────────────────┘ └──────────────────┘ └───────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
                                 │
-                ┌───────────────┼───────────────┐
-                ▼               ▼               ▼
-        ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-        │ Tray Icon    │ │ AppLocalData│ │ 多窗口      │
-        │ (NSMenu,     │ │ store.json  │ │ panel/login │
-        │  多语言菜单) │ │ logs/       │ │ /about/...  │
-        └─────────────┘ └─────────────┘ └─────────────┘
+                ┌───────────────┼───────────────┬──────────────────┐
+                ▼               ▼               ▼                  ▼
+        ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌──────────────────┐
+        │ Tray Icon    │ │ AppLocalData│ │ 多窗口      │ │ 官方房间 wss      │
+        │ (NSMenu,     │ │ store.json  │ │ panel/login │ │ (经本地中继，     │
+        │  多语言菜单) │ │ logs/       │ │ /about/...  │ │  Origin 白名单)   │
+        └─────────────┘ └─────────────┘ └─────────────┘ └──────────────────┘
 ```
 
 ### 2.3 运行时数据流
@@ -209,22 +223,68 @@
                               + pressed_keys 位图更新
                                       │
                                       ▼
-                              ctx.tx.try_send(TapMsg::Key)   ← 回调内不阻塞
-                                      │
+                  ctx.tx.try_send(TapMsg::Key(key,pressed,code,flags))
+                                      │  ← 回调内不阻塞（code/flags 供快捷键匹配）
                                       ▼
                               input-emitter 线程 recv
                                       │
-                                      ▼
-                              emit_to("main", "key-press", key)
-                                      │
-                                      ▼
-                              WebView main Vue SPA 监听 key-press
-                                      │
-                                      ▼
-                              更新打字计数 / 桌宠响应
+                              ┌───────┴────────────────────────┐
+                              ▼ (press 沿)                      ▼
+                   crate::match_shortcut(code,flags)    未命中 / release
+                   capture 模式或不匹配 → 走下行             │
+                              │ 命中                          │
+                              ▼                              ▼
+              emit_to("main","app-shortcut",action)  emit_to("main","key-press",key)
+              （吞掉 key-press，不计打字数）                    │
+                                                             ▼
+                                             WebView main Vue SPA 监听 key-press
+                                                             │
+                                                             ▼
+                                                     更新打字计数 / 桌宠响应
 ```
 
 > 全局键盘事件需要「输入监控」权限；只有辅助功能时 tap 为 ListenOnly，收不到 KeyUp/KeyDown，此时只有 main 窗口聚焦时的原生 keydown 会计数。
+
+#### 全局快捷键流（1.0.3 新增）
+
+```
+CGEventTap KeyDown（携带 CGKeyCode + CGEventFlags）
+  ▼ emitter 线程（tap 回调禁止加锁，匹配只能后置）
+match_shortcut：capture 模式? → 跳过
+  dom_key_from_cg（kVK→DOM keyCode）+ dom_mods_from_cg（flags→Alt1/Ctrl2/Shift4/Meta8）
+  非 F 键（key<112）必须带 Ctrl/Alt/Meta（与前端 shortcutFromEvent 同约束）
+  ▼ 查 AppShortcuts 表（store.json app_shortcuts 持久化；默认 F7=gameMode/F8=switchScreen/F9=togglePet）
+命中 → emit_to("main", "app-shortcut", "gameMode"|"switchScreen"|"togglePet")
+       且不再发 key-press（快捷键不计入打字计数）
+前端执行动作；配置变更由 set_app_shortcuts 广播 "app-shortcuts-changed" 给所有窗口
+```
+
+#### 游戏模式检测流（1.0.3 新增）
+
+```
+前端 refreshDesktopMetrics（定时）
+  └▶ invoke get_main_desktop_safe_area
+        └▶ fullscreen::foreground_application_fullscreen()
+              CGWindowListCopyWindowInfo(OnScreenOnly) 遍历：
+              layer==0（普通应用层）+ 非本进程 + bounds 完整覆盖主屏？
+        └▶ 返回 {insets:0, foregroundFullscreen, foregroundApplicationFullscreen}
+  └▶ 前端状态变化 → autoGameModeOnFullscreen 自动进/退游戏模式（禁用桌宠交互）
+      + 写 localStorage 设置 + SETTINGS_GAME_MODE_EVENT 广播（纯前端）
+```
+
+#### 房间 socket.io 中继流（1.0.1-beta 新增）
+
+```
+前端（补丁 ey()）─ ws://127.0.0.1:17321/socket.io/?...infoToken...
+                        │（tauri:// 页面为非 secure context，连 ws:// 无混合内容限制）
+                        ▼
+              ws_proxy accept（握手回调捕获 path+query）
+                        │ 外连 wss://api-mc-wuwatappo.kurogames-global.com<path_query>
+                        │ 请求头改写 Origin: http://tauri.localhost（服务端白名单值）
+                        ▼
+              官方服务端 101 ── 双向透传 Text/Binary/Ping/Pong/Close
+（直连时 Origin=tauri://localhost 被服务端 403，按钮置灰；详见 §4.7）
+```
 
 #### 窗口创建流（以 panel 为例）
 
@@ -304,9 +364,11 @@ WuwaTappo-macos/
     │   └── ios/                    # iOS 图标（Tauri 标准结构）
     │
     └── src/                        # Rust 源码
-        ├── main.rs                 # 可执行入口（main → lib::run）
-        ├── lib.rs                  # Tauri 应用主逻辑（1403 行）
-        └── input.rs                # 全局输入监听模块（864 行）
+        ├── main.rs                 # 可执行入口（main → lib::run，6 行）
+        ├── lib.rs                  # Tauri 应用主逻辑（1698 行：53 命令/窗口/托盘/快捷键/登录补发）
+        ├── input.rs                # 全局输入监听（921 行：CGEventTap + 快捷键触发匹配）
+        ├── fullscreen.rs           # 前台应用全屏检测（118 行，游戏模式数据源，CGWindowList FFI）
+        └── ws_proxy.rs             # 房间 socket.io 本地中继代理（134 行，Origin 白名单绕过）
 ```
 
 ---
@@ -318,7 +380,10 @@ WuwaTappo-macos/
 #### 文件位置
 
 - [main.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/main.rs) (6 行)
-- [lib.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/lib.rs) (1403 行)
+- [lib.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/lib.rs) (1698 行)
+- [input.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/input.rs) (921 行)
+- [fullscreen.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/fullscreen.rs) (118 行，1.0.3)
+- [ws_proxy.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/ws_proxy.rs) (134 行，1.0.1-beta)
 
 #### 启动流程
 
@@ -334,9 +399,11 @@ main()
               ├── .plugin(tauri_plugin_updater::Builder::new().build())
               │
               ├── .setup(|app| { ... })   ← 应用初始化钩子
-              │     ├── manage(SharedTrayState)
-              │     ├── manage(SharedMainHitState)
-              │     ├── manage(InputBridgeReady)
+              │     ├── manage(SharedTrayState / SharedMainHitState / SharedMainGeom)
+              │     ├── manage(InputBridgeReady / LoginIntent)
+              │     ├── manage(AppShortcuts)     ← 1.0.3：store.json 存档或默认 F7/F8/F9
+              │     ├── manage(ShortcutCapture)  ← 1.0.3：快捷键录入期暂停全局触发
+              │     ├── ws_proxy::spawn()        ← 1.0.1-beta：启动房间 WS 中继 :17321
               │     ├── 创建 Tray Icon
               │     ├── 重建托盘菜单（rebuild_tray_menu）
               │     ├── main 窗口 set_visible_on_all_workspaces(true)
@@ -345,9 +412,12 @@ main()
               │
               ├── .on_page_load(...)   ← 页面加载完成钩子
               │     ├── 注入前端诊断脚本（onerror/unhandledrejection 捕获 + 10s 心跳）
-              │     └── 屏蔽所有窗口右键菜单（contextmenu preventDefault）
+              │     ├── 屏蔽所有窗口右键菜单（contextmenu preventDefault）
+              │     └── login 窗口：延时 800/1500/3000ms 三次补发 login-modal-open
+              │         （intent 经 LoginIntent state 透传；1.0.1-beta 发布版已剥离
+              │           XHR/KrSDK/手机号日志强诊断，需要时按 git 历史 6121302 恢复）
               │
-              ├── .invoke_handler(tauri::generate_handler![...40+ 命令...])
+              ├── .invoke_handler(tauri::generate_handler![...53 个命令...])
               │
               └── .run(tauri::generate_context!())
                     └── 进入 Tauri 主消息循环
@@ -361,7 +431,7 @@ WKWebView 对"无活动"页面会执行 idle 挂起（JS 冻结、timer 停转�
 
 #### 文件位置
 
-- [input.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/input.rs) (864 行)
+- [input.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/input.rs) (921 行)
 
 #### 核心职责
 
@@ -370,6 +440,7 @@ WKWebView 对"无活动"页面会执行 idle 挂起（JS 冻结、timer 停转�
 | 全局键鼠事件采集 | `CGEventTap`（HIDEventTap + HeadInsertEventTap），**Default / ListenOnly 双模式** |
 | 阻止点击穿透 | Default 模式下对桌宠区域内的 press/drag/up 返回 `null` 吞掉事件 |
 | 键码映射 | macOS virtual keycode → `KeyboardEvent.key` 风格字符串（覆盖 104 键 + 小键盘 + 功能键） |
+| 全局快捷键触发（1.0.3） | `TapMsg::Key` 携带 (CGKeyCode, CGEventFlags)，emitter 线程调 `match_shortcut` 匹配，命中 emit `app-shortcut` 并吞 key-press |
 | 事件节流 | mouse-move 最小 16ms 间隔（约 60fps） |
 | 命中区域过滤 | `hit_test()` per-region 判断（纯内存，读几何缓存） |
 | 双权限处理 | 辅助功能（`AXIsProcessTrusted`）+ 输入监控（`CGPreflightListenEventAccess` / `CGRequestListenEventAccess`） |
@@ -378,7 +449,7 @@ WKWebView 对"无活动"页面会执行 idle 挂起（JS 冻结、timer 停转�
 
 #### 两种 tap 模式（关键设计）
 
-macOS 对 CGEventTap 的权限要求分两级，必须区分：
+macOS 对 CGEventTap 的权限要求分两级，必须区分（新版 macOS 设置中「辅助功能」已更名为**「设备控制和数据访问」**，API 仍为 `AXIsProcessTrusted`）：
 
 | 模式 | 权限要求 | 能力 | 本移植中的用途 |
 |------|----------|------|----------------|
@@ -428,7 +499,8 @@ global-input 线程 (worker)
   ├── 建立 CGEventTap
   ├── CFRunLoop::run_in_mode（分片 50ms）
   │     └── event_tap_callback（必须微秒级返回）
-  │           ├── KeyDown/KeyUp → 维护 pressed_keys 位图 → try_send(TapMsg::Key)
+  │           ├── KeyDown/KeyUp → 维护 pressed_keys 位图
+  │           │     → try_send(TapMsg::Key(name,pressed,code,flags))
   │           ├── FlagsChanged → handle_flags_changed → try_send(TapMsg::Key)
   │           ├── MouseMoved/Dragged → 节流 → try_send(TapMsg::Move)
   │           ├── MouseDown → hit_test → try_send(TapMsg::Button) → 命中则 return null 吞掉
@@ -437,7 +509,11 @@ global-input 线程 (worker)
   └── 分片循环：needs_restart → 补发 stale key-release → tap_enable(true)
 
 input-emitter 线程（独立）
-  └── 从 sync_channel(1024) 取 TapMsg → emit_to 前端 / 投递 Hover 到主线程
+  └── 从 sync_channel(1024) 取 TapMsg：
+        ├── Key(press) → match_shortcut(code,flags)（1.0.3，需加锁故只能在此）
+        │     命中 → emit "app-shortcut"（吞 key-press）；capture 模式/未命中 → key-press
+        ├── Move → emit mouse-move；Button → emit mouse-button
+        └── Hover → run_on_main_thread(apply_pointer_hover)
 ```
 
 **为什么必须通道化**：CGEventTap 回调超过系统阈值（约 0.25s）时，**该事件会被系统直接丢弃**。一旦 KeyUp 被丢，系统认为按键一直按着 → 触发键盘重复，表现为按 Cmd+Q 退出时字符疯狂刷屏。回调里任何 `emit_to` / 写盘 / `Mutex::lock` 都可能触发，因此全部移到独立线程，回调只做内存判断与 `try_send`（队列满则丢帧，绝不阻塞）。
@@ -462,8 +538,8 @@ input-emitter 线程（独立）
 
 `TapContext.pressed_keys: AtomicU64` 记录 keycode < 64 的按键按下状态（位图）。用途：
 
-- tap 被系统禁用 → 重启时 `swap(0)` 取出所有"仍按下"的键，逐个补发 `key-release`
-- 前端 `index-DmC0wUEw.js` 的 `_c()/kc()` 用 `Pr` Set 做去重：**keyup 一旦丢失，该键会永久卡在 Set 里，表现为"计数器用一会儿就彻底不计数"**
+- tap 被系统禁用 → 重启时 `swap(0)` 取出所有"仍按下"的键，逐个补发 `key-release`（1.0.3 补发消息携带 code 但 flags=0，不参与快捷键匹配）
+- 前端房间/panel chunk（1.0.3 `index-pp8VWaUF.js`，1.0.1 `index-DmC0wUEw.js`）的 `_c()/kc()` 用 `Pr` Set 做去重：**keyup 一旦丢失，该键会永久卡在 Set 里，表现为"计数器用一会儿就彻底不计数"**
 - 补发 release 是清理这一残留的唯一手段
 
 #### 降级防穿透（`apply_pointer_hover`）
@@ -494,7 +570,9 @@ input-emitter 线程（独立）
 
 > **关键架构**：main 窗口是 **全屏透明 shell**（覆盖整个屏幕），`ignoresMouseEvents` 恒穿透。桌宠本体绘制在右下角 CSS 区域（绝对定位）。所有辅助窗口不穿透，正常接收点击。全部窗口共用同一个 `index.html`，靠 hash 路由区分页面。
 
-> **⚠️ 临时诊断代码（e5e6375）**：`open_login_window`（lib.rs L800）在创建 login 窗口后会注入**红色背景**（`document.documentElement/body background #ff0000`），用于区分"窗口不存在"与"内容未渲染"两种登录不可见情形。**这是 BUG 1 的诊断脚手架，根因确认后必须移除**，否则正常登录界面会带红底。详见 §11。
+> **登录窗拖拽（1.0.3）**：官方 1.0.3 新增 `startLoginWindowDrag`，为纯前端 mousedown → `window.startDragging()` 实现，`capabilities/main.json` 已含 `core:window:allow-start-dragging`，Rust 侧无需改动。
+
+> **红底/强诊断已剥离**：e5e6375 的红色背景与 6121302 的 XHR/KrSDK 强诊断注入曾用于定位 BUG 1（§11.1）；1.0.1-beta 发布版（e67ef53）已全部移除（避免手机号/验证码/token 响应体落盘）。当前 `on_page_load` 的 login 分支只保留 `login-modal-open` 补发逻辑；调试期可按 git 历史 6121302 恢复强诊断。
 
 #### 交互管线（本移植的核心）
 
@@ -664,7 +742,7 @@ app.emit("tray-set-pet-scale", 125.0)
 
 ### 4.5 前端-后端命令桥（Invoke Handlers）
 
-项目共注册 **50 个自定义 Tauri 命令**（与官方 exe 逆向清单 1:1），按功能分组：
+项目共注册 **53 个自定义 Tauri 命令**（与官方 exe 逆向清单 1:1；1.0.1 为 50 个，1.0.3 新增快捷键 3 个），按功能分组：
 
 #### 更新与遥测（7 个）
 
@@ -701,7 +779,7 @@ app.emit("tray-set-pet-scale", 125.0)
 | `apply_main_window_position` | 设置 alwaysOnTop + 可选落位 |
 | `set_main_window_fullscreen_shell` | 全屏 shell 模式（Win32 专属，故意返回 Err 走 fallback） |
 | `set_main_window_monitor_bounds` | 移动窗口到目标显示器坐标 |
-| `get_main_desktop_safe_area` | 桌面安全区（Windows 任务栏避让，macOS 返回零） |
+| `get_main_desktop_safe_area` | 桌面安全区（insets 恒零）+ **1.0.3 返回 `foregroundFullscreen`/`foregroundApplicationFullscreen`**（fullscreen.rs 检测，游戏模式数据源） |
 | `get_main_taskbar_insets` | 任务栏 insets（macOS 恒零） |
 | `finish_main_window_monitor_switch` | 显示器切换收尾（macOS no-op） |
 | `sync_aux_windows_to_main_monitor` | 辅助窗口跟随主窗口显示器 |
@@ -715,7 +793,7 @@ app.emit("tray-set-pet-scale", 125.0)
 | `has_maintenance_notice` | 是否有待展示公告（恒 false） |
 | `hide_main_after_maintenance_notice_ready` | 公告就绪后隐藏主窗口 |
 
-#### 辅助窗口管理（12 个）
+#### 辅助窗口管理（13 个）
 
 | 命令族 | 命令 |
 |--------|------|
@@ -725,7 +803,17 @@ app.emit("tray-set-pet-scale", 125.0)
 | About | `open_about_window`, `close_about_window` |
 | OSS Notice | `open_oss_notice_window`, `close_oss_notice_window` |
 
-#### 自启动、存储、退出（7 个）
+#### 自定义快捷键（1.0.3 新增，3 个）
+
+| 命令 | 签名 | 说明 |
+|------|------|------|
+| `get_app_shortcuts` | `() → Value` | 返回 action→{modifiers,key} 配置（store.json 存档或默认 F7/F8/F9） |
+| `set_app_shortcuts` | `(config: Value) → Result<Value, String>` | 保存配置：duplicate 校验（冲突返回 Err `"duplicate"`，前端 String(e) 精确匹配）、持久化 `app_shortcuts`、广播 `app-shortcuts-changed` |
+| `set_shortcut_capture` | `(active: bool) → Result<()>` | 设置页录入按键期间暂停全局快捷键触发（ShortcutCapture AtomicBool） |
+
+> 快捷键**触发**不是命令：CGEventTap 在 emitter 线程匹配命中后 emit `app-shortcut` 事件（详见 §4.9）。
+
+#### 自启动、存储、退出（8 个）
 
 | 命令 | 说明 |
 |------|------|
@@ -756,9 +844,16 @@ app.emit("tray-set-pet-scale", 125.0)
     "count": 5678,
     "cuid": "user-id-string",
     "environment": "production"
+  },
+  "app_shortcuts": {
+    "gameMode": { "modifiers": 0, "key": 118 },
+    "switchScreen": { "modifiers": 0, "key": 119 },
+    "togglePet": { "modifiers": 0, "key": 120 }
   }
 }
 ```
+
+> `app_shortcuts` 为 1.0.3 新增：modifiers 位编码 Alt=1/Ctrl=2/Shift=4/Meta=8，key 为 DOM keyCode（F7=118/F8=119/F9=120）。启动时读取；缺失或为空回落到官方默认绑定。
 
 #### 存储函数
 
@@ -781,8 +876,60 @@ app.emit("tray-set-pet-scale", 125.0)
 
 | 文件 | 用途 |
 |------|------|
-| `/tmp/wuwatappo-diag.log` | 窗口/状态诊断（keep-alive 线程前 2 分钟双写） |
+| `/tmp/wuwatappo-diag.log` | 窗口/状态诊断（keep-alive 线程前 2 分钟双写）；ws_proxy 中继建立/关闭也写此文件（`[ws-proxy]` 前缀） |
 | `/tmp/wuwatappo-input.log` | 输入模块权限状态记录 |
+
+### 4.7 房间 socket.io 本地中继代理 (`ws_proxy.rs`，1.0.1-beta)
+
+[ws_proxy.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/ws_proxy.rs)（134 行）解决联机房间在 macOS 下连不上的问题。
+
+**根因**（curl 实锤）：房间长连接为 socket.io over WebSocket，默认 `wss://api-mc-wuwatappo.kurogames-global.com/socket.io`。服务端握手校验 **Origin 白名单**：
+
+| Origin | 结果 |
+|--------|------|
+| `http://tauri.localhost`（官方 Windows WebView2） | 101 放行 |
+| `tauri://localhost`（macOS WKWebView） | **403 拒绝** |
+| 无 Origin | 放行 |
+
+WKWebView 发起 WebSocket 时自动携带页面 origin，前端 JS 无法修改该头 → socket 永远连不上 → 创建/加入房间按钮置灰（前端前置检查 `reason_code: socket_disconnected`）。
+
+**实现**：
+
+- setup 时 `ws_proxy::spawn()`（tokio 任务；bind 失败仅 dlog，不影响其他功能）；本地监听 **`127.0.0.1:17321`**（`PROXY_PORT`，前端补丁 `ey()` 硬编码同值）
+- 前端经补丁改连 `ws://127.0.0.1:17321/socket.io/?...`（tauri:// 为非 secure context，连 ws:// 回环不受混合内容限制）
+- `accept_hdr_async` 握手回调捕获前端请求的 path+query（含 infoToken 凭据，必须原样转发）
+- 以 `Origin: http://tauri.localhost`（`SPOOF_ORIGIN`）外连官方 wss，目标 host 硬编码（`TARGET_HOST`）
+- 双向透传 Text/Binary/Ping/Pong/Close（`futures_util::future::select`，任一方向结束即收尾）
+- 日志脱敏：relay 日志只记 path 不记 query（query 含 infoToken）
+- 安全面：仅绑回环地址、上游 host 硬编码，无开放监听/任意转发
+
+### 4.8 前台全屏检测 (`fullscreen.rs`，1.0.3 游戏模式数据源)
+
+[fullscreen.rs](file:///Users/chen/AI/桌宠/WuwaTappo-macos/src-tauri/src/fullscreen.rs)（118 行）为 Windows 前台窗口检测的 macOS 等价实现。唯一公开函数 `foreground_application_fullscreen() -> bool`：
+
+1. `CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)` 取在屏窗口列表；
+2. 逐窗口判定：`kCGWindowLayer == 0`（普通应用层；桌宠 main=floating(3)/aux=4 天然排除，桌面/菜单栏/浮动层同样排除）；
+3. 排除本进程（`kCGWindowOwnerPID == 自身 pid`）；
+4. `CGRectMakeWithDictionaryRepresentation` 解析 `kCGWindowBounds`，bounds 完整覆盖主显示器（`CGDisplayBounds(CGMainDisplayID())`，0.5pt 容差）即判定全屏。
+
+要点：窗口列表（layer/bounds/pid）**不需要屏幕录制权限**（仅读取窗口名需要）；普通"最大化"窗口不覆盖菜单栏区域（y>0）不会误判，只有全屏 Space 窗口 bounds==整屏（含菜单栏）才命中。因 objc2-core-graphics crate feature 未覆盖这些 API，全部采用手写 CoreGraphics/CoreFoundation FFI。
+
+调用方：`get_main_desktop_safe_area` 命令把结果同时放入 `foregroundFullscreen` 与 `foregroundApplicationFullscreen` 字段；前端 `refreshDesktopMetrics` 轮询读取，状态变化时 `autoGameModeOnFullscreen` 自动进入/退出游戏模式（游戏模式下禁用桌宠交互；另可托盘/快捷键手动切换）。
+
+### 4.9 自定义快捷键系统 (`lib.rs` + `input.rs`，1.0.3)
+
+对齐官方 1.0.3 的三个新命令与两个事件，全局触发复用 CGEventTap。
+
+**编码契约**（与前端 main bundle 的 `eventModifiers`/`keyFromEvent`/`shortcutFromEvent` 对齐）：
+
+- modifiers 位编码：Alt(Option)=1 | Ctrl=2 | Shift=4 | Meta(Cmd)=8（`dom_mods_from_cg` 由 CGEventFlags 映射）
+- key = DOM keyCode（`dom_key_from_cg` 由 macOS kVK 映射）：F1-F12=112-123、字母=大写 ASCII（A=65）、数字主排=48-57、Space=32、方向键 37-40、PageUp/PageDown/End/Home=33-36
+- 有效性约束（与前端一致）：key<112（非 F 键）必须带 Ctrl/Alt/Meta 之一（`mods & 11 != 0`），否则不匹配
+- 默认绑定（`default_shortcuts`，同官方 `DEFAULT_APP_SHORTCUTS`）：**F7=gameMode、F8=switchScreen、F9=togglePet**
+
+**触发链**：tap 回调只把 (code, flags) 随 `TapMsg::Key` 入队（回调禁止加锁）；`input-emitter` 线程对 press 沿调 `match_shortcut`：capture 模式（设置页正在录入按键）直接跳过 → 查表命中则 `emit_to("main", "app-shortcut", action)` 并**吞掉 key-press**（快捷键不计打字计数，release 仍照常发送清理前端去重 Set）。
+
+**配置链**：设置页 ShortcutInput 用前端 DOM keydown 录入（录入前 invoke `set_shortcut_capture(true)`，结束后置 false）；保存调 `set_app_shortcuts` → duplicate 校验（key=0 视为"未设置"跳过；冲突返回 Err `"duplicate"`，前端按 `String(e)` 精确匹配弹提示）→ 写 store.json → 广播 `app-shortcuts-changed` 给所有窗口（main 更新触发器、panel 刷新显示）。
 
 ---
 
@@ -792,10 +939,14 @@ app.emit("tray-set-pet-scale", 125.0)
 
 | 类型 | 位置 (行号) | 说明 |
 |------|------------|------|
-| `MenuLabels` | L28-57 | 多语言托盘文案结构体（14 个字段，带 serde default） |
-| `TrayState` | L74-80 | 托盘运行时状态 |
-| `SharedTrayState` | L81 | 托盘状态托管（Mutex<TrayState>） |
-| `InputBridgeReady` | L1040 | 输入桥就绪标志（Arc<AtomicBool>） |
+| `MenuLabels` | L38-67 | 多语言托盘文案结构体（14 个字段，带 serde default） |
+| `TrayState` | L84-90 | 托盘运行时状态 |
+| `SharedTrayState` | L91 | 托盘状态托管（Mutex<TrayState>） |
+| `InputBridgeReady` | L1119 | 输入桥就绪标志（Arc<AtomicBool>） |
+| `LoginIntent` | L1124 | open_login_window 的 intent 暂存（Mutex<String>），on_page_load 补发事件时透传 |
+| `ShortcutBinding` | L1135-1139 | 快捷键绑定 `{modifiers: u32, key: u32}`（1.0.3） |
+| `AppShortcuts` | L1142 | action→ShortcutBinding 表托管（Mutex<HashMap>）（1.0.3） |
+| `ShortcutCapture` | L1146 | 快捷键录入态标志（Arc<AtomicBool>），录入时暂停全局触发（1.0.3） |
 
 ### 5.2 input.rs 核心类型
 
@@ -806,8 +957,17 @@ app.emit("tray-set-pet-scale", 125.0)
 | `SharedMainHitState` | 命中状态托管（`Mutex<MainHitState>`），前端 `set_main_hit_region` 写入 |
 | `MainGeom` | 窗口几何快照：main 的 visible/x/y/w/h、辅助窗口列表 `aux`、`front_force_ignore`、`pointer_in_pet` |
 | `SharedMainGeom` | 几何快照托管（`Mutex<MainGeom>`），tap 线程只读 |
-| `TapMsg` | tap 回调 → 发送线程的消息枚举：`Key` / `Move` / `Button` / `Hover` |
+| `TapMsg` | tap 回调 → 发送线程的消息枚举：`Key(&'static str, bool, u16, u64)`（键名/按下?/**CGKeyCode/CGEventFlags**，后两者 1.0.3 快捷键匹配用）/ `Move` / `Button` / `Hover` |
 | `TapContext` | CGEventTap 回调上下文：`app`、`last_move_ms`、`swallowing`、`pointer_in_pet`、`active_default`、`tx`、`pressed_keys`、`needs_tap_restart` |
+
+### 5.2.1 fullscreen.rs / ws_proxy.rs 关键项（1.0.3 / 1.0.1-beta）
+
+| 项 | 位置 | 说明 |
+|----|------|------|
+| `fullscreen::foreground_application_fullscreen` | fullscreen.rs L72 | 遍历在屏窗口判定其他应用全屏（游戏模式数据源） |
+| `ws_proxy::spawn` | ws_proxy.rs L33 | 启动 127.0.0.1:17321 中继（tokio 任务） |
+| `ws_proxy::PROXY_PORT` | ws_proxy.rs L26 | `17321`（前端补丁硬编码同值） |
+| `ws_proxy::handle_conn` | ws_proxy.rs L56 | 单连接：握手捕获 path+query → Origin 改写外连 → 双向透传 |
 
 ### 5.3 关键函数
 
@@ -823,9 +983,14 @@ app.emit("tray-set-pet-scale", 125.0)
 | `sync_main_layer` | `fn sync_main_layer(app)` | 幂等兜底：把 main 恢复 `always_on_top(true)`（新方案 main 恒置顶，不再降级） |
 | `ensure_aux_level` | `fn ensure_aux_level(win)` | objc2 `setLevel(4)`：aux 窗口恒压 main（floating 3）之上 |
 | `open_panel` | `fn open_panel(app, tab) → Result<()>` | 打开 panel 并聚焦 tab |
-| `dlog` | `pub fn dlog(msg: &str)` | 双写诊断日志（stdout + /tmp 文件） |
+| `dlog` | `pub fn dlog(msg: &str)` | 双写诊断日志（stdout + /tmp 文件；ws_proxy 共用） |
 | `chrono_date` / `chrono_time` | `fn → String` | 自实现日期/时间格式化 |
 | `store_path` / `store_read` / `store_write` | — | 本地 store.json 读写 |
+| `default_shortcuts` | `fn () → HashMap<String, ShortcutBinding>` | 官方默认绑定 F7=gameMode/F8=switchScreen/F9=togglePet（1.0.3） |
+| `shortcuts_to_json` / `shortcuts_from_json` | `fn → Value` / `fn (&Value) → HashMap` | 快捷键配置序列化/宽松解析（1.0.3） |
+| `dom_key_from_cg` | `pub fn (u16) → Option<u32>` | macOS kVK → DOM keyCode（F 键/字母/数字/命名键）（1.0.3） |
+| `dom_mods_from_cg` | `pub fn (u64) → u32` | CGEventFlags → modifiers 位编码 Alt1/Ctrl2/Shift4/Meta8（1.0.3） |
+| `match_shortcut` | `pub fn (app, code, flags) → Option<String>` | emitter 线程调用：capture 跳过 → 键位映射 → 查 AppShortcuts 表（1.0.3） |
 
 #### input.rs 函数
 
@@ -837,9 +1002,9 @@ app.emit("tray-set-pet-scale", 125.0)
 | `hit_test` | `pub fn hit_test(app, gx, gy) → bool` | 命中测试（读几何缓存，`try_lock`） |
 | `refresh_main_geom` | `pub fn refresh_main_geom(app)` | 主线程刷新几何缓存（100ms 节流） |
 | `apply_pointer_hover` | `pub fn apply_pointer_hover(app, in_pet)` | ListenOnly 降级：按指针位置切换窗口穿透 |
-| `spawn_emitter` | `fn spawn_emitter(app, rx)` | 独立发送线程：从 channel 取消息并 emit 给前端 |
+| `spawn_emitter` | `fn spawn_emitter(app, rx)` | 独立发送线程：取消息 emit；**Key(press) 先调 `crate::match_shortcut`，命中 emit `app-shortcut` 并吞 key-press**（1.0.3） |
 | `update_pointer_mode` | `fn update_pointer_mode(ctx, gx, gy)` | 跨越桌宠边界时入队 `Hover`（Default 模式不启用） |
-| `emit_key` | `fn emit_key(ctx, key, pressed)` | 入队 `TapMsg::Key` |
+| `emit_key` | `fn emit_key(ctx, key, pressed, code, flags)` | 入队 `TapMsg::Key(name,pressed,CGKeyCode,CGEventFlags)`（1.0.3 签名扩展） |
 | `emit_mouse_button` | `fn emit_mouse_button(ctx, right, press)` | 入队 `TapMsg::Button` |
 | `handle_mouse_button_now` | `pub fn handle_mouse_button_now(app, right, press)` | 直接 emit mouse-button（供非 tap 路径调用） |
 | `mark_input_bridge_ready` | `pub fn mark_input_bridge_ready(app)` | 前端握手回调（仅日志观测） |
@@ -852,60 +1017,63 @@ app.emit("tray-set-pet-scale", 125.0)
 
 ### 5.4 lib.rs 命令处理器完整清单
 
-> 共 50 个命令，按官方签名 1:1 重建。行号为 2026-11-02 快照（含 e5e6375 login 诊断代码后的 lib.rs 1403 行版本），改动后以函数名为准。
+> 共 53 个命令（1.0.3：官方 50 + 快捷键 3），按官方签名 1:1 重建。行号为 2026-11-02 1.0.3-beta 快照（lib.rs 1698 行版本），改动后以函数名为准。注册顺序以 `generate_handler!` 列表为准（快捷键命令插在 login 与 resize_login 之间）。
 
 | # | 命令函数 | 行号 | 返回类型 | 分类 |
 |---|---------|------|----------|------|
-| 1 | `check_app_update` | L90 | `async Result<Option<Value>, String>` | 更新 |
-| 2 | `get_track_os_info` | L124 | `Value` | 遥测 |
-| 3 | `is_force_update_locked` | L135 | `bool` | 维护 |
-| 4 | `open_maintenance_notice` | L142 | `()` | 维护 |
-| 5 | `show_toast_overlay` | L151 | `async Result<(), String>` | Toast |
-| 6 | `sync_native_menu` | L188 | `()` | 托盘 |
-| 7 | `write_app_log` | L212 | `Result<(), String>` | 日志 |
-| 8 | `set_main_hit_region` | L294 | `Result<(), String>` | 命中区域 |
-| 9 | `set_main_force_cursor_ignore` | L330 | `Result<(), String>` | 穿透 |
-| 10 | `set_main_swallow_mouse` | L352 | `()` | Win32 no-op |
-| 11 | `set_main_skip_taskbar` | L359 | `Result<(), String>` | Dock |
-| 12 | `set_main_window_content_bounds` | L369 | `Result<(), String>` | 窗口尺寸 |
-| 13 | `set_overlay_cursor` | L407 | `()` | Win32 no-op |
-| 14 | `sync_main_window_to_current_monitor` | L414 | `Result<(), String>` | 显示器同步 |
-| 15 | `popup_main_dock_context_menu` | L447 | `Result<(), String>` | 右键菜单 |
-| 16 | `get_boot_diagnostics` | L470 | `Value` | 诊断 |
-| 17 | `is_devtools_hotkeys_build` | L488 | `bool` | 构建标记 |
-| 18 | `is_internal_testing_build` | L495 | `bool` | 构建标记 |
-| 19 | `apply_main_window_position` | L506 | `Result<(), String>` | 窗口位置 |
-| 20 | `set_main_window_fullscreen_shell` | L543 | `Result<(), String>` | Win32 only |
-| 21 | `set_main_window_monitor_bounds` | L550 | `Result<(), String>` | 显示器切换 |
-| 22 | `get_main_desktop_safe_area` | L576 | `Value` | 安全区 |
-| 23 | `get_main_taskbar_insets` | L586 | `Value` | 任务栏 |
-| 24 | `finish_main_window_monitor_switch` | L593 | `()` | no-op |
-| 25 | `sync_aux_windows_to_main_monitor` | L600 | `()` | 辅助窗口 |
-| 26 | `get_app_update_detail` | L622 | `Option<Value>` | 更新详情 |
-| 27 | `get_maintenance_notice_payload` | L629 | `Option<Value>` | 公告 |
-| 28 | `has_maintenance_notice` | L636 | `bool` | 公告状态 |
-| 29 | `hide_main_after_maintenance_notice_ready` | L643 | `()` | 公告后隐藏 |
-| 30 | `open_panel_window` | L746 | `Result<(), String>` | 面板 |
-| 31 | `close_panel_window` | L765 | `()` | 面板 |
-| 32 | `raise_panel_window_above_pets` | L775 | `()` | 面板层级 |
-| 33 | `set_panel_window_collapsed` | L785 | `Result<(), String>` | 面板折叠 |
-| 34 | `open_login_window` | L800 | `Result<(), String>` | 登录 |
-| 35 | `close_login_window` | L824 | `()` | 登录 |
-| 36 | `resize_login_window_to_content` | L833 | `Result<(), String>` | 登录尺寸 |
-| 37 | `open_update_window` | L848 | `Result<(), String>` | 更新窗口 |
-| 38 | `close_update_window` | L863 | `()` | 更新窗口 |
-| 39 | `open_about_window` | L872 | `Result<(), String>` | 关于 |
-| 40 | `close_about_window` | L879 | `()` | 关于 |
-| 41 | `open_oss_notice_window` | L888 | `Result<(), String>` | OSS |
-| 42 | `close_oss_notice_window` | L895 | `()` | OSS |
-| 43 | `is_elevated_autostart_enabled` | L908 | `Result<bool, String>` | 自启动 |
-| 44 | `set_elevated_autostart` | L917 | `Result<(), String>` | 自启动 |
-| 45 | `load_key_press_count` | L963 | `i64` | 打字计数 |
-| 46 | `save_key_press_count` | L984 | `()` | 打字计数 |
-| 47 | `load_cumulative_click_count` | L996 | `Value` | 累计点击 |
-| 48 | `save_cumulative_click_count` | L1021 | `()` | 累计点击 |
-| 49 | `notify_input_bridge_ready` | L1043 | `()` | 握手 |
-| 50 | `exit_app` | L1054 | `()` | 退出 |
+| 1 | `check_app_update` | L100 | `async Result<Option<Value>, String>` | 更新 |
+| 2 | `get_track_os_info` | L134 | `Value` | 遥测 |
+| 3 | `is_force_update_locked` | L145 | `bool` | 维护 |
+| 4 | `open_maintenance_notice` | L152 | `()` | 维护 |
+| 5 | `show_toast_overlay` | L161 | `async Result<(), String>` | Toast |
+| 6 | `sync_native_menu` | L204 | `()` | 托盘 |
+| 7 | `write_app_log` | L228 | `Result<(), String>` | 日志 |
+| 8 | `set_main_hit_region` | L310 | `Result<(), String>` | 命中区域 |
+| 9 | `set_main_force_cursor_ignore` | L346 | `Result<(), String>` | 穿透 |
+| 10 | `set_main_swallow_mouse` | L368 | `()` | Win32 no-op |
+| 11 | `set_main_skip_taskbar` | L375 | `Result<(), String>` | Dock |
+| 12 | `set_main_window_content_bounds` | L385 | `Result<(), String>` | 窗口尺寸 |
+| 13 | `set_overlay_cursor` | L423 | `()` | Win32 no-op |
+| 14 | `sync_main_window_to_current_monitor` | L430 | `Result<(), String>` | 显示器同步 |
+| 15 | `popup_main_dock_context_menu` | L463 | `Result<(), String>` | 右键菜单 |
+| 16 | `get_boot_diagnostics` | L486 | `Value` | 诊断 |
+| 17 | `is_devtools_hotkeys_build` | L504 | `bool` | 构建标记 |
+| 18 | `is_internal_testing_build` | L511 | `bool` | 构建标记 |
+| 19 | `apply_main_window_position` | L522 | `Result<(), String>` | 窗口位置 |
+| 20 | `set_main_window_fullscreen_shell` | L559 | `Result<(), String>` | Win32 only |
+| 21 | `set_main_window_monitor_bounds` | L566 | `Result<(), String>` | 显示器切换 |
+| 22 | `get_main_desktop_safe_area` | L592 | `Value` | 安全区 + **全屏检测字段（1.0.3）** |
+| 23 | `get_main_taskbar_insets` | L608 | `Value` | 任务栏 |
+| 24 | `finish_main_window_monitor_switch` | L615 | `()` | no-op |
+| 25 | `sync_aux_windows_to_main_monitor` | L622 | `()` | 辅助窗口 |
+| 26 | `get_app_update_detail` | L644 | `Option<Value>` | 更新详情 |
+| 27 | `get_maintenance_notice_payload` | L651 | `Option<Value>` | 公告 |
+| 28 | `has_maintenance_notice` | L658 | `bool` | 公告状态 |
+| 29 | `hide_main_after_maintenance_notice_ready` | L665 | `()` | 公告后隐藏 |
+| 30 | `open_panel_window` | L800 | `Result<(), String>` | 面板 |
+| 31 | `close_panel_window` | L819 | `()` | 面板 |
+| 32 | `raise_panel_window_above_pets` | L829 | `()` | 面板层级 |
+| 33 | `set_panel_window_collapsed` | L841 | `Result<(), String>` | 面板折叠 |
+| 34 | `open_login_window` | L856 | `Result<(), String>` | 登录 |
+| 35 | `close_login_window` | L895 | `()` | 登录（延迟 1.2s 防 auth 链腰斩） |
+| 36 | `get_app_shortcuts` | L1180 | `Value` | **快捷键（1.0.3）** |
+| 37 | `set_app_shortcuts` | L1191 | `Result<Value, String>` | **快捷键（1.0.3，duplicate 校验）** |
+| 38 | `set_shortcut_capture` | L1217 | `Result<(), String>` | **快捷键（1.0.3）** |
+| 39 | `resize_login_window_to_content` | L912 | `Result<(), String>` | 登录尺寸 |
+| 40 | `open_update_window` | L927 | `Result<(), String>` | 更新窗口 |
+| 41 | `close_update_window` | L942 | `()` | 更新窗口 |
+| 42 | `open_about_window` | L951 | `Result<(), String>` | 关于 |
+| 43 | `close_about_window` | L958 | `()` | 关于 |
+| 44 | `open_oss_notice_window` | L967 | `Result<(), String>` | OSS |
+| 45 | `close_oss_notice_window` | L974 | `()` | OSS |
+| 46 | `is_elevated_autostart_enabled` | L987 | `Result<bool, String>` | 自启动 |
+| 47 | `set_elevated_autostart` | L996 | `Result<(), String>` | 自启动 |
+| 48 | `load_key_press_count` | L1042 | `i64` | 打字计数 |
+| 49 | `save_key_press_count` | L1063 | `()` | 打字计数 |
+| 50 | `load_cumulative_click_count` | L1075 | `Value` | 累计点击 |
+| 51 | `save_cumulative_click_count` | L1100 | `()` | 累计点击 |
+| 52 | `notify_input_bridge_ready` | L1285 | `()` | 握手 |
+| 53 | `exit_app` | L1296 | `()` | 退出 |
 
 ---
 
@@ -916,7 +1084,7 @@ app.emit("tray-set-pet-scale", 125.0)
 ```toml
 [package]
 name = "wuwatappo-macos"
-version = "1.0.1"
+version = "1.0.3-beta"                          # 跟随官方 1.0.3 前端资产
 edition = "2021"
 
 [lib]
@@ -951,6 +1119,11 @@ tauri-plugin-updater = "2"                      # 应用更新检查
 [target."cfg(target_os = \"macos\")".dependencies]
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGEvent", "CGEventTypes"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFMachPort", "CFRunLoop"] }
+objc2 = "0.6"                                   # NSWindow setLevel（aux 窗口物理分层）
+# 房间 socket.io 本地中继（ws_proxy.rs，1.0.1-beta）
+tokio = { version = "1", features = ["net", "io-util"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
 ```
 
 ### 6.2 依赖关系图
@@ -972,9 +1145,17 @@ macOS 专属:
     └── CGEventTap / CGEvent / CGEventField / CGEventMask / CGEventType
   objc2-core-foundation 0.3.2
     └── CFMachPort / CFRunLoop / kCFRunLoopDefaultMode
+  objc2 0.6
+    └── NSWindow setLevel:（aux 窗口层级物理分层）
+  tokio 1 (net, io-util) + tokio-tungstenite 0.26 (rustls 原生根证书)
+    └── ws_proxy.rs：本地 socket.io 中继（TcpListener + wss 外连）
+  futures-util 0.3
+    └── SinkExt/StreamExt + future::select（WS 双向透传）
+  手写 CoreGraphics/CoreFoundation FFI（fullscreen.rs）
+    └── CGWindowListCopyWindowInfo / CGRectMakeWithDictionaryRepresentation
 
 基础:
-  serde 1 + derive → JSON 序列化
+  serde 1 + derive → JSON 序列化（含 ShortcutBinding）
   serde_json 1 → JSON 值处理
   log 0.4 → 日志门面（配合 Tauri 内部 logger）
 ```
@@ -983,8 +1164,9 @@ macOS 专属:
 
 | 框架 | 用途 | 链接方式 |
 |------|------|----------|
-| CoreGraphics | CGEventTap / CGGetDisplaysWithPoint | `#[link(name = "CoreGraphics", kind = "framework")]` |
+| CoreGraphics | CGEventTap / CGGetDisplaysWithPoint（input.rs）；CGWindowListCopyWindowInfo / CGDisplayBounds / CGMainDisplayID（fullscreen.rs） | `#[link(name = "CoreGraphics", kind = "framework")]` |
 | ApplicationServices | AXIsProcessTrusted() 辅助功能权限查询 | `#[link(name = "ApplicationServices", kind = "framework")]` |
+| CoreFoundation | CFArray/CFDictionary/CFNumber/CFRelease（fullscreen.rs 手写 FFI）；CFRunLoop/CFMachPort（input.rs 经 objc2 绑定） | 系统库（隐式 + objc2-core-foundation） |
 
 ### 6.4 编译配置
 
@@ -996,6 +1178,15 @@ opt-level = "s"        # 体积优化（桌宠 App 越小越好）
 strip = true           # 去除调试符号
 ```
 
+**发布匿名化（1.0.1-beta 起）**：构建时经环境变量传入顶层 flag 把编译机绝对路径重映射为虚拟前缀：
+
+```bash
+RUSTFLAGS="--remap-path-prefix=$(pwd)=/build/wuwatappo" cargo tauri build
+strings src-tauri/target/release/wuwatappo-macos | grep -c "/Users/"   # 期望 0
+```
+
+（cargo 1.99 下 `-C remap-path-prefix` 与 profile `trim-paths` 均不稳定，须用顶层 `--remap-path-prefix` flag。）同时发布版剥离了 login 强诊断注入（手机号/验证码/token 不落盘），ws 代理日志仅记 path 不记 query。
+
 ---
 
 ## 7. 配置文件说明
@@ -1005,6 +1196,7 @@ strip = true           # 去除调试符号
 | 字段 | 值 | 说明 |
 |------|-----|------|
 | `productName` | `WuwaTappo` | 应用显示名 |
+| `version` | `1.0.3-beta` | 应用版本（与 Cargo.toml 同步；跟随官方前端资产版本） |
 | `identifier` | `com.kuro.wuwatappo.cn` | Bundle ID |
 | `frontendDist` | `../frontend` | 前端 dist 目录（编译时嵌入） |
 | `macOSPrivateApi` | `true` | 启用 macOS 私有 API |
@@ -1166,11 +1358,11 @@ rm -rf ~/Library/Caches/com.kuro.wuwatappo.cn
 
 | 工具 | 位置 | 用途 |
 |------|------|------|
-| 命令序列日志 | `/tmp/wuwatappo-diag.log` | 所有 50 个命令入口 + hit-region payload/解析结果双写，定位前端初始化链断点 |
+| 命令序列日志 | `/tmp/wuwatappo-diag.log` | 所有 53 个命令入口 + hit-region payload/解析结果双写，定位前端初始化链断点；ws_proxy 中继状态（`[ws-proxy]`） |
 | 输入模式日志 | `/tmp/wuwatappo-input.log` | `default/swallow` = 输入监控已授权（吞事件）；`listen-only` = 只有辅助功能（点击穿透且收不到键盘） |
 | 启动诊断 | 前 2 分钟 diag 行 | 窗口几何 / bridge_ready / regions 数量快照 |
 | 应用日志 | `$APPLOCALDATA/logs/app-YYYYMMDD.log` | 前端 onerror/unhandledrejection + 10s 心跳（WKWebView 的 console 不可见） |
-| 存储数据 | `$APPLOCALDATA/native-store/store.json` | 打字计数 / 点击计数持久化 |
+| 存储数据 | `$APPLOCALDATA/native-store/store.json` | 打字计数 / 点击计数 / 快捷键配置（app_shortcuts）持久化 |
 | 标准输出 | `println!` | LaunchServices 启动时可能被丢弃，以文件为准 |
 
 #### 快速定位命令
@@ -1212,12 +1404,16 @@ cat ~/Library/Application\ Support/com.kuro.wuwatappo.cn/native-store/store.json
 | 4 | **辅助窗口遮挡判定** | 辅助窗口（panel/login/toast）不穿透，点击应归属它们自己；mouse-down 需排除辅助窗口区域 | hit_test() |
 | 5 | **裸数字返回打字计数** | 官方如此：`load_key_press_count` 返回裸 i64（前端 `Number(payload)` 解析），`load_cumulative_click_count` 返回对象。重建命令时勿"统一"格式，前端按官方格式解析 | load_key_press_count 返回 i64 |
 | 6 | **Keep-alive eval("void 0")** | WKWebView 会对"无活动"页面执行 **idle 挂起**（JS 冻结、timer 停转）——用户点开登录窗后 main 页面即被冻结，表现为"按键统计停止、桌宠无响应"（Windows WebView2 无此行为）。每 5 秒对所有窗口 eval("void 0") 维持活跃 | setup() 后台线程 |
-| 7 | **lib.rs 单文件** | 命令处理器密集时集中管理更易维护，避免多文件组织复杂度 | 整个 lib.rs |
+| 7 | **按模块拆分 Rust 源码（1.0.1-beta 起）** | 早期 lib.rs 单文件集中管理；随平台能力增加拆分为 lib.rs（命令/窗口/托盘/快捷键）、input.rs（输入桥）、ws_proxy.rs（房间中继）、fullscreen.rs（全屏检测），每个平台模块带文件头注释说明根因与契约 | src/ 四个文件 |
 | 8 | **Default tap 优先、ListenOnly 降级** | macOS 只有 Default（active）tap 能吞事件实现"点击不穿透"，但它额外要求「输入监控」权限；ListenOnly 只需「辅助功能」但点击必穿透且收不到键盘。因此运行时按权限探测结果动态选择，并在拿到权限后热切换 | run_worker() |
-| 9 | **通道化事件发送** | tap 回调超时会让事件被系统丢弃（KeyUp 丢失 → 按键重复刷屏）。回调只做内存判断 + `try_send`，emit/写盘/主线程 API 全部移到 `input-emitter` 线程 | TapMsg + spawn_emitter |
+| 9 | **通道化事件发送** | tap 回调超时会让事件被系统丢弃（KeyUp 丢失 → 按键重复刷屏）。回调只做内存判断 + `try_send`，emit/写盘/主线程 API 全部移到 `input-emitter` 线程。**1.0.3 快捷键匹配（需查 Mutex<HashMap>）同样只能放在 emitter 线程，绝不进回调** | TapMsg + spawn_emitter |
 | 10 | **几何缓存替代实时窗口查询** | Tauri 窗口 API 必须在主线程；在 tap 线程调用会导致进程静默崩溃。改为主线程维护 `SharedMainGeom` 快照，回调只读 | MainGeom + refresh_main_geom |
 | 11 | **aux 窗口用 NSWindow level 物理分层，main 恒置顶** | main 是全屏 alwaysOnTop(3) 窗口，与辅助窗口同层靠 orderFront 时序不可控（login visible=true 但被盖住；panel 经前端 JS 关闭绕过 Rust 命令 → main 降级后永不恢复、桌宠被其他 app 盖）。旧"动态降 main"方案已废弃：aux 创建/show 后 `ensure_aux_level` setLevel(4)，main 永不降级 | ensure_aux_level / sync_main_layer |
 | 12 | **固定证书签名** | adhoc 签名每次编译 cdhash 变化，TCC 授权失效，用户被迫反复授权。改用固定证书（`WuwaTappo Dev Signing`）后授权跨编译保持 | 构建流程 |
+| 13 | **房间 socket.io 本地中继 + Origin 改写（1.0.1-beta）** | 服务端 Origin 白名单只放行 `http://tauri.localhost`，WKWebView 的 `tauri://localhost` 被 403 且前端无法改 WebSocket Origin；不破解服务端，改为本地回环中继外发时冒充官方 Windows origin。绑回环+host 硬编码+日志脱敏控制安全面 | ws_proxy.rs + 前端 ey() 补丁 |
+| 14 | **游戏模式用 CGWindowList 全屏检测（1.0.3）** | 对齐官方 Windows 前台窗口 API：遍历在屏窗口找 layer==0/非本进程/覆盖主屏的窗口；无需屏幕录制权限，最大化窗口不误判 | fullscreen.rs + get_main_desktop_safe_area |
+| 15 | **全局快捷键复用输入桥 + 前后端同编码契约（1.0.3）** | 不引入 RegisterHotKey 类新机制：Key 消息携带 code/flags，emitter 线程按 DOM keyCode + modifiers 位编码匹配官方默认/用户配置；命中吞 key-press 不计打字数；capture 模式让路前端 DOM 录入；duplicate 错误字符串与官方契约一致（前端 String(e) 精确匹配） | lib.rs match_shortcut + input.rs |
+| 16 | **发布版剥离登录强诊断 + 路径匿名化（1.0.1-beta）** | XHR/KrSDK 钩子会把手机号/验证码/token 响应体写入本地日志；调试期的红底/console/网络钩子不随发布版分发（git 历史可恢复），并 remap-path-prefix 去除编译机路径 | e67ef53 |
 
 ### 9.2 开发者必读：macOS 移植踩坑记录（改相关代码前必读）
 
@@ -1279,34 +1475,36 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
 | `SetWindowRgn` 区域穿透 | `set_ignore_cursor_events(true/false)` | macOS WebKit 原生穿透支持 |
 | `SetCapture` 鼠标捕获 | 全局 CGEventTap + 事件合成 | macOS 无等价捕获，靠全局事件桥兜底 |
 | `HMENU` 坐标弹出 | `Muda ContextMenu::popup()` | 原生 NSMenu 跟随鼠标位置弹出 |
-| `RegisterHotKey` 全局热键 | 当前未实现（预留） | 可通过 CGEventTap + 前端逻辑实现 |
+| `RegisterHotKey` 全局热键 | **1.0.3 已实现**：CGEventTap emitter 线程 `match_shortcut` + `app-shortcut` 事件（F7/F8/F9 可配置） | 复用输入桥，编码对齐前端 DOM keyCode/modifiers |
+| 前台窗口/全屏检测（游戏模式） | **1.0.3 已实现**：`CGWindowListCopyWindowInfo` 遍历 layer==0 覆盖窗口（fullscreen.rs） | Win32 前台窗口 API 的 macOS 等价 |
 | `SetWindowsHookEx` 键鼠 hook | `CGEventTap` | macOS 官方全局事件监听 API |
 | 任务栏 `SHGetRect` | 返回零 insets | macOS 桌宠不与 Dock 重叠，无需避让 |
 | 全屏 shell 模式 | 故意返回 Err → 前端走 fallback | Windows 专属窗口层级技巧 |
+| socket.io 直连（房间） | **本地中继代理 ws://127.0.0.1:17321 + Origin 改写** | 服务端 Origin 白名单拒绝 tauri://，非 Win32 差异但同属平台桥接（§4.7） |
 
 ### 9.4 已知限制
 
 | 限制 | 说明 | 优先级 |
 |------|------|--------|
-| **无 darwin 更新通道** | 官方 updater 服务器仅有 windows-x86_64 条目，darwin 目标缺失；跟随官方版本需手动更新前端 dist 并重编译 | 低（社区移植，不影响核心功能） |
-| **联机房间 / 开箱等玩法** | 依赖官方服务端可用性，与官方 exe 端同源同命运 | 低（非本项目控制范围） |
-| **辅助功能 + 输入监控需授权** | 两个独立 TCC 开关：辅助功能决定能否建 tap，输入监控决定能否 **吞事件 / 监听键盘**。用固定证书签名后授权可跨编译保持（详见踩坑 §5） | 中 |
+| **无 darwin 更新通道** | 官方 updater 服务器仅有 windows-x86_64 条目，darwin 目标缺失；跟随官方版本需手动更新前端 dist 并重编译（1.0.3 即手动跟随） | 低（社区移植，不影响核心功能） |
+| **联机房间经本地中继** | socket.io 不能直连（Origin 白名单 403），需本机 `ws_proxy` 常驻监听 127.0.0.1:17321；代理 bind 失败时房间功能不可用（其余功能不受影响，diag 日志有记录）。玩法本身仍依赖官方服务端可用性 | 中 |
+| **辅助功能 + 输入监控需授权** | 两个独立 TCC 开关：辅助功能决定能否建 tap，输入监控决定能否 **吞事件 / 监听键盘**（快捷键触发同样依赖）。自签名证书（TeamIdentifier=not set）不保证授权跨编译保持，重编译后需核对 | 中 |
 | **全屏 shell 未实现** | `set_main_window_fullscreen_shell` 故意返回 Err，前端用 window API fallback（功能等价但实现路径不同） | 中 |
-| **小键盘 / JIS 键盘键码映射** | 经 BongoCat 表校准，未在全键盘布局实测 | 低 |
-| **dmg 未公证** | adhoc 签名，他人下载首次打开需右键 → 打开 | 低 |
-| **多显示器 scale 估算** | `display_scale_at()` 物理像素/逻辑点计算，精度略低于 NSScreen.backingScaleFactor | 低 |
+| **小键盘 / JIS 键盘键码映射** | 经 BongoCat 表校准，未在全键盘布局实测；快捷键 `dom_key_from_cg` 覆盖常用键但未做全布局校验 | 低 |
+| **dmg 未公证** | adhoc/自签名，他人下载首次打开需右键 → 打开 | 低 |
+| **多显示器 scale 估算** | `display_scale_at()` 物理像素/逻辑点计算，精度略低于 NSScreen.backingScaleFactor；游戏模式全屏检测当前只看主显示器（`CGMainDisplayID`） | 低 |
 
-### 9.5 源码中的 no-op 命令
+### 9.5 源码中的 no-op / 语义降级命令
 
-以下命令在 macOS 上为空实现（保留是为了前端命令协议完整性）：
+以下命令在 macOS 上为空实现或语义降级（保留是为了前端命令协议完整性）：
 
 | 命令 | 原由 |
 |------|------|
 | `set_main_swallow_mouse` | Win32 穿透切换瞬间吞掉鼠标消息防闪烁；macOS 无此问题 |
 | `set_overlay_cursor` | Win32 宠物 hover 换手型光标；macOS 系统自管 |
 | `finish_main_window_monitor_switch` | Windows 恢复输入劫持；macOS 无劫持概念 |
-| `get_main_desktop_safe_area` | Windows 任务栏避让；macOS 返回零 |
-| `get_main_taskbar_insets` | 同上 |
+| `get_main_desktop_safe_area` | insets 恒零（无任务栏避让）；**但 1.0.3 起非纯 no-op：另返回 `foregroundFullscreen`/`foregroundApplicationFullscreen` 全屏检测字段（fullscreen.rs）** |
+| `get_main_taskbar_insets` | Windows 任务栏；macOS 恒零 |
 
 ---
 
@@ -1316,8 +1514,10 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
 
 | Event Name | Payload | 触发场景 |
 |------------|---------|----------|
-| `key-press` | `"W"`, `"F5"`, `"Shift"`, `"ArrowUp"` | 用户按键（CGEventTap → 通道 → emitter 线程）**需输入监控权限** |
+| `key-press` | `"W"`, `"F5"`, `"Shift"`, `"ArrowUp"` | 用户按键（CGEventTap → 通道 → emitter 线程）**需输入监控权限；1.0.3 命中快捷键时被吞不发** |
 | `key-release` | 同上 | 按键释放（tap 重启时会补发 stale release） |
+| `app-shortcut` | `"gameMode"`, `"switchScreen"`, `"togglePet"`（action 名字符串） | **1.0.3**：全局快捷键匹配命中（emitter 线程 → main）；capture 录入期不触发 |
+| `app-shortcuts-changed` | `{gameMode:{modifiers,key}, ...}` | **1.0.3**：`set_app_shortcuts` 保存后向所有窗口广播配置变更 |
 | `mouse-move` | `{x: 1440.0, y: 900.0}` (物理像素) | 鼠标移动（节流到 60fps） |
 | `mouse-button` | `{button: "left"|"right", action: "press"|"release"}` | 鼠标按下/释放（不因命中与否而丢弃，前端自行判定） |
 | `dock-open-panel` | `"bag"`, `"atlas"`, `"exchange"`, `"room"`, `"settings"` | 托盘左键点击 / 打开菜单项 |
@@ -1364,9 +1564,12 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
              raise_panel_window_above_pets, set_panel_window_collapsed
   [Login]    open_login_window, close_login_window,
              resize_login_window_to_content
+  [快捷键]   get_app_shortcuts, set_app_shortcuts,      ← 1.0.3 新增
+             set_shortcut_capture
   [Update]   open_update_window, close_update_window
   [About]    open_about_window, close_about_window
   [OSS]      open_oss_notice_window, close_oss_notice_window
+  [自启动]   is_elevated_autostart_enabled, set_elevated_autostart
   [存储]     load_key_press_count, save_key_press_count,
              load_cumulative_click_count, save_cumulative_click_count
   [退出]     notify_input_bridge_ready, exit_app
@@ -1377,6 +1580,14 @@ bundle id 相同时 `open xxx.app` 会复用已运行实例，导致"改了代�
 ## 11. 当前 BUG 现场诊断与修复路线（2026-11-02）
 
 > 本章基于全量代码 Review + 运行时日志现场证据（`/tmp/wuwatappo-input.log`、`/tmp/wuwatappo-diag.log`、`~/Library/Application Support/com.kuro.wuwatappo.cn/logs/app-*.log`）整理，是后续修复工作的作战地图。
+
+> **✅ 修复状态更新（1.0.1-beta / 1.0.3-beta，2026-11-02 晚）**：本章记录的三大 BUG 均已闭环——
+> - **BUG 1（登录/联机）**：`login-modal-open` 补发 + intent 透传 + cookie shim + auth 链防腰斩 + NSWindow level 分层；1.0.1-beta 冒烟验证**登录态跨重启存活**。诊断脚手架（红底/XHR/KrSDK 钩子）已从发布版剥离。
+> - **BUG 2（键盘不计数）**：双权限齐备后 Default tap 生效；权限轮询死循环已修。
+> - **BUG 3（拖拽/点击）**：同 BUG 2 根因，授权后 Default 模式吞事件解决。
+> - **房间按钮置灰（§11.1 后期新发现）**：socket.io 服务端 Origin 白名单 403，已由 `ws_proxy.rs` 本地中继修复，冒烟验证 socket 自动重连 upstream 101。
+> - **1.0.3-beta**：跟随官方升级，新增游戏模式/自定义快捷键/登录窗拖拽；useLogin/modalBridge 字节级未变，登录修复全部兼容。
+> 下文保留完整现场证据与推理链，供回归排查参考；当前版本的架构以 §1-§10、§12 为准。
 
 ### 11.0 现场证据摘要
 
@@ -1574,9 +1785,11 @@ P3  重新打包 dmg（当前 bundle 内 dmg 是 10-27 adhoc 旧版）+ 固定�
 
 | 版本 | 日期 | 内容 |
 |------|------|------|
+| 1.0.3-beta | 2026-11-02 | 跟随官方 1.0.3 前端（126 资产整体替换，chunk 7→10，新美术）：游戏模式（fullscreen.rs CGWindowList 全屏检测 → autoGameModeOnFullscreen）、自定义快捷键（get/set_app_shortcuts + set_shortcut_capture，默认 F7/F8/F9，CGEventTap 匹配触发、录入保护、store.json 持久化）、登录窗拖拽（纯前端 startDragging）；4 项移植补丁全量平移（应用名 102 处、isdk https、ey() 本地代理、输入桥观测点改 internals 直呼）；useLogin/modalBridge 字节级未变 |
+| 1.0.1-beta | 2026-11-02 | 首个登录+联机全打通版本：cookie shim 登录态持久化、login-modal-open 补发与 intent 透传、NSWindow level 物理分层（桌宠恒置顶）、房间 socket.io 本地中继代理（ws_proxy.rs，Origin 白名单绕过）、auth 链防腰斩（close 延迟 + overlay-close 延迟）；发布版匿名化（remap-path-prefix 路径重映射、XHR/KrSDK 强诊断剥离） |
 | v0.0.1-Beta | 2026-10-28 | 首个开源版本：壳重建完成，修复 hit_region 字段解析（left/top）、KuroSDK https 加载、计数持久化、WKWebView keep-alive、面板 1240×800 适配 |
 
-> 版本号说明：壳（本仓库）独立版本号 v0.x；`Cargo.toml` / `tauri.conf.json` 中的 1.0.1 沿袭官方前端资产版本，便于对应官方功能集。
+> 版本号说明：1.0.1-beta 起版本号与官方前端资产版本对齐（便于对应官方功能集），`-beta` 后缀表示社区移植测试版；壳（本仓库）不设独立 v0.x 号。
 
 ## 附录 B：桌宠缩放与透明度档位
 
@@ -1600,8 +1813,11 @@ cat /tmp/wuwatappo-input.log
 ls ~/Library/Application\ Support/com.kuro.wuwatappo.cn/native-store/logs/
 cat ~/Library/Application\ Support/com.kuro.wuwatappo.cn/native-store/logs/app-*.log
 
-# 本地存储数据
+# 本地存储数据（含 1.0.3 app_shortcuts 快捷键配置）
 cat ~/Library/Application\ Support/com.kuro.wuwatappo.cn/native-store/store.json
+
+# 房间中继状态（1.0.1-beta）：listening / relay established / upstream 状态
+grep ws-proxy /tmp/wuwatappo-diag.log
 ```
 
 ## 附录 D：参考项目
@@ -1618,5 +1834,5 @@ cat ~/Library/Application\ Support/com.kuro.wuwatappo.cn/native-store/store.json
 
 ---
 
-*文档生成日期：2026-10-28 | 最近全量 Review：2026-11-02（基于 lib.rs 1403 行 + input.rs 864 行源码逐行核对）*  
-*同步自 README.md v0.0.1-Beta（2026-10-28 更新）*
+*文档生成日期：2026-10-28 | 最近全量 Review：2026-11-02（1.0.3-beta 同步：基于 lib.rs 1698 行 + input.rs 921 行 + fullscreen.rs 118 行 + ws_proxy.rs 134 行源码逐行核对；§12 为 1.0.3 升级实施记录）*  
+*同步自 README.md 1.0.3-beta（2026-11-02 更新）*
