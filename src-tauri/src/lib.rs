@@ -157,22 +157,41 @@ fn open_maintenance_notice<R: Runtime>(app: AppHandle<R>, payload: Option<serde_
 }
 
 /// Toast 覆盖层：创建/显示 label="toast" 的透明置顶小窗，前端跨窗口事件渲染内容
+///
+/// 必须是同步命令（主线程执行）：函数体内无 await；此前误标 async 导致跑在
+/// tokio-rt-worker 上，ensure_aux_level 的裸 setLevel: 触发 macOS 26+ 的
+/// WindowManagement 主线程断言（EXC_BREAKPOINT "Must only be used from the
+/// main thread"）——全屏进游戏模式弹 toast 时必崩（2026-11-03 崩溃报告实锤）。
 #[tauri::command]
-async fn show_toast_overlay<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+fn show_toast_overlay<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     println!("[cmd] show_toast_overlay");
     const TOAST_LABEL: &str = "toast";
     if let Some(win) = app.get_webview_window(TOAST_LABEL) {
         let _ = win.show();
         let _ = win.set_always_on_top(true);
         ensure_aux_level(&win);
-        let _ = win.set_focus();
+        // 恒穿透：toast 是纯展示层（官方 #/toast 视图仅一个 aria-hidden 容器），
+        // 穿透保证即使窗口几何意外异常也不会吞屏幕点击。
+        let _ = win.set_ignore_cursor_events(true);
+        // 不再 set_focus：set_focus 走 makeKeyAndOrderFront + activateIgnoringOtherApps，
+        // 每次弹 toast 都把整个 app 抢到前台——用户点任何窗口、一按键焦点就被
+        // invisible 的 toast 夺走（2026-11-03 全屏退出后焦点丢失 bug 实锤）。
         return Ok(());
     }
     let (w, h) = (420.0, 120.0);
     let mut b = WebviewWindowBuilder::new(
         &app,
         TOAST_LABEL,
-        WebviewUrl::App("index.html".into()),
+        // 必须带 #/toast 路由（官方路由表有专用 toast 视图 index-C55u91jw.js）。
+        // 此前用裸 index.html 命中默认路由 "/" → toast 窗口挂载了完整主宠物应用，
+        // 幻影启动链三重破坏（2026-11-03 双 bug 根因）：
+        // ① set_main_window_fullscreen_shell 返回 Err → 前端 De() fallback 用
+        //    getCurrentWindow() 把 toast 自己 setPosition/setSize 成整个显示器
+        //    → 层 4 透明不穿透窗口盖全屏，吞掉所有点击（无法聚焦任何窗口）；
+        // ② set_main_hit_region 上报 toast 幻影布局区域，覆盖真实 main 的命中
+        //    状态 → 点击桌宠不匹配任何区域，互动全灭；
+        // ③ apply_main_window_position 按 toast 所在显示器把 main 窗口挪走。
+        WebviewUrl::App("index.html#/toast".into()),
     )
     .title("WuwaTappo Toast")
     .user_agent(WEBVIEW_UA)
@@ -182,6 +201,7 @@ async fn show_toast_overlay<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
     .skip_taskbar(true)
     .resizable(false)
     .shadow(false)
+    .focused(false)
     .inner_size(w, h);
     if let Ok(monitor) = app.primary_monitor() {
         if let Some(m) = monitor {
@@ -195,6 +215,7 @@ async fn show_toast_overlay<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
     b.build().map_err(|e| e.to_string())?;
     if let Some(win) = app.get_webview_window(TOAST_LABEL) {
         ensure_aux_level(&win);
+        let _ = win.set_ignore_cursor_events(true);
     }
     Ok(())
 }
@@ -554,10 +575,16 @@ fn apply_main_window_position<R: Runtime>(
 }
 
 /// Windows 全屏 shell 模式（穿透层接管全屏）。
-/// 有意返回 Err：让前端走官方 fallback（setPosition/setSize + sync monitor），macOS 语义更正确。
+/// main 调用时有意返回 Err：让前端走官方 fallback（setPosition/setSize + sync monitor），
+/// macOS 语义更正确。非 main 调用一律假成功：前端 De() fallback 是对
+/// getCurrentWindow()（调用窗口自己）做全屏 resize——辅助窗口若误跑主启动链，
+/// 返回 Err 会让它把自己撑满显示器（2026-11-03 toast 全屏吞点击事故根因之一）。
 #[tauri::command]
-fn set_main_window_fullscreen_shell<R: Runtime>(_app: AppHandle<R>) -> Result<(), String> {
-    println!("[cmd] set_main_window_fullscreen_shell");
+fn set_main_window_fullscreen_shell<R: Runtime>(window: tauri::WebviewWindow<R>) -> Result<(), String> {
+    println!("[cmd] set_main_window_fullscreen_shell from={}", window.label());
+    if window.label() != "main" {
+        return Ok(());
+    }
     Err("fullscreen shell is windows-only; use window api fallback".into())
 }
 
@@ -684,14 +711,40 @@ fn hide_main_after_maintenance_notice_ready<R: Runtime>(app: AppHandle<R>) {
 #[cfg(target_os = "macos")]
 const AUX_WINDOW_LEVEL: i64 = 4;
 
+/// NSWindow setLevel: 裸调用（仅限主线程；-[_WMWindow setWindowLevel:] 在
+/// macOS 26+ 走 WindowManagement 事务，非主线程直接 brk 陷阱崩溃）。
+#[cfg(target_os = "macos")]
+unsafe fn apply_aux_level(ns: *mut std::ffi::c_void) {
+    let obj = ns as *mut objc2::runtime::AnyObject;
+    let _: () = objc2::msg_send![obj, setLevel: AUX_WINDOW_LEVEL];
+}
+
+/// 把 aux 窗口抬到层 4。tauri 的窗口方法（show/close/set_always_on_top/eval…）
+/// 内部经事件循环代理调度到主线程，任意线程可调；但本函数用裸 msg_send 绕过
+/// 了该通道，必须自己保证线程：主线程内联执行，非主线程捕获 label 派发到
+/// 主线程重取窗口再压层（异步派发与 tao 内部 dispatch 同为 FIFO，
+/// set_always_on_top 之后补调本函数的时序语义不变）。
 #[cfg(target_os = "macos")]
 fn ensure_aux_level<R: Runtime>(win: &tauri::WebviewWindow<R>) {
-    if let Ok(ns) = win.ns_window() {
-        unsafe {
-            let obj = ns as *mut objc2::runtime::AnyObject;
-            let _: () = objc2::msg_send![obj, setLevel: AUX_WINDOW_LEVEL];
-        }
+    extern "C" {
+        fn pthread_main_np() -> i32;
     }
+    if unsafe { pthread_main_np() } != 0 {
+        if let Ok(ns) = win.ns_window() {
+            unsafe { apply_aux_level(ns) };
+        }
+        return;
+    }
+    let app = win.app_handle().clone();
+    let app2 = app.clone();
+    let label = win.label().to_string();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(w) = app2.get_webview_window(&label) {
+            if let Ok(ns) = w.ns_window() {
+                unsafe { apply_aux_level(ns) };
+            }
+        }
+    });
 }
 
 #[cfg(not(target_os = "macos"))]

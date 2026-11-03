@@ -152,7 +152,10 @@ pub fn refresh_main_geom<R: tauri::Runtime>(app: &AppHandle<R>) {
             g.y = y;
             g.w = w;
             g.h = h;
-        } else if visible {
+        } else if visible && label != "toast" {
+            // toast 是恒穿透（ignore_cursor_events）的纯通知层，不拥有任何点击，
+            // 不参与遮挡判定——否则它覆盖区域内的桌宠点击会被误吞
+            // （2026-11-03 toast 异常全屏时全场点击被排除的教训）。
             aux.push((label, x, y, w, h));
         }
     }
