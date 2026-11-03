@@ -54,7 +54,7 @@
 
 ## 功能特性
 
-> 当前壳版本 **1.0.3-beta**（跟随官方 1.0.3 前端资产；beta 后缀表示社区移植测试版）。可执行安装包见 [GitHub Releases](https://github.com/EchoAI-01/WuwaTappo-macos/releases)。
+> 当前壳版本 **1.0.3-beta1**（跟随官方 1.0.3 前端资产；beta 后缀表示社区移植测试版）。可执行安装包见 [GitHub Releases](https://github.com/EchoAI-01/WuwaTappo-macos/releases)。
 
 | 功能 | 状态 | 说明 |
 |---|---|---|
@@ -300,7 +300,7 @@ WuwaTappo-macos/
 
 | 键 | 当前值 | 说明 |
 |---|---|---|
-| `productName` / `version` | `WuwaTappo` / `1.0.3-beta` | 壳版本跟随官方前端版本 + beta 后缀 |
+| `productName` / `version` | `WuwaTappo` / `1.0.3-beta1` | 壳版本跟随官方前端版本 + beta 后缀 |
 | `identifier` | `com.kuro.wuwatappo.cn` | 与官方一致；WebKit 数据目录 / TCC 展示名按此解析 |
 | `build.frontendDist` | `../frontend` | 编译期嵌入官方 dist |
 | `app.macOSPrivateApi` | `true` | 透明窗口等私有 API 必需 |
@@ -455,6 +455,8 @@ adhoc 签名产物未公证，他人首次打开需 **右键 → 打开**（绕�
 
 | 问题 | 修复 | 版本 |
 |---|---|---|
+| 其他应用进全屏时桌宠崩溃（EXC_BREAKPOINT "Must only be used from the main thread"） | `show_toast_overlay` 误标 async 跑在 tokio 线程，裸 `msg_send![setLevel:]` 触发 macOS 26+ WindowManagement 主线程断言；改同步命令（主线程执行）+ `ensure_aux_level` 加 `pthread_main_np` 守卫、非主线程经 `run_on_main_thread` 派发 | 1.0.3-beta1 |
+| 给了权限仍无法拖拽/互动桌宠 + 退出全屏后所有窗口无法聚焦、一按键就失焦 | toast 窗口用裸 `index.html` 命中默认路由，挂载了幻影主应用：自我全屏化（层 4 透明不穿透窗盖全屏吞所有点击）、上报幻影 hit-region 覆盖真实命中状态、把 main 挪去别的显示器、每次弹 toast `set_focus` 抢系统激活。修复：toast 改用官方 `#/toast` 专用路由 + 恒点击穿透 + `focused(false)` + 删 `set_focus`；`set_main_window_fullscreen_shell` 按调用方 label 门控；hit-test 遮挡判定排除 toast | 1.0.3-beta1 |
 | 登录浮层不渲染（透明窗不可见） | 补发官方 `login-modal-open` 事件 + intent 透传 + cookie shim 持久化登录态 + auth 链防腰斩（close 延迟 1200ms） | 1.0.1-beta |
 | 未聚焦时键盘不计数 / 拖拽点击间歇失效 | 输入监控授权引导 + Default tap 吞事件 + 事件转发改异步 channel（防回调超时丢 KeyUp）+ tap 重启补发 release | v0.0.1-Beta → 1.0.1-beta |
 | 桌宠被其他窗口覆盖 | NSWindow level 物理分层：main 恒 floating(3)、aux 恒 4 | 1.0.1-beta |
@@ -475,6 +477,7 @@ adhoc 签名产物未公证，他人首次打开需 **右键 → 打开**（绕�
 
 | 版本 | 日期 | 内容 | Release |
 |---|---|---|---|
+| 1.0.3-beta1 | 2026-11-03 | 稳定性修复：根治其他应用全屏触发的崩溃（async 命令 tokio 线程裸 `setLevel:` → macOS 26+ 主线程断言，改同步命令 + 主线程守卫派发）；根治 toast 窗口幻影主应用（裸 index.html 命中默认路由 → 官方 `#/toast` 路由隔离），修复"给了权限也无法互动桌宠"与"退出全屏后所有窗口无法聚焦"双 bug；toast 恒穿透/不抢焦点，全屏化 fallback 按调用方门控 | [v1.0.3-beta1](https://github.com/EchoAI-01/WuwaTappo-macos/releases/tag/v1.0.3-beta1) |
 | 1.0.3-beta | 2026-11-02 | 跟随官方 1.0.3 前端：游戏模式（CGWindowList 全屏检测）、自定义快捷键（F7/F8/F9 可改键，全局触发 + 录入保护）、登录窗拖拽、新美术资源；4 项移植补丁全量平移 | [v1.0.3-beta](https://github.com/EchoAI-01/WuwaTappo-macos/releases) |
 | 1.0.1-beta | 2026-11-02 | 首个登录+联机全打通版本：cookie shim 登录态持久化、login-modal-open 补发与 intent 透传、NSWindow level 物理分层（桌宠恒置顶）、房间 socket.io 本地中继代理（Origin 白名单绕过）、auth 链防腰斩；发布版匿名化（路径重映射/诊断剥离） | [v1.0.1-beta](https://github.com/EchoAI-01/WuwaTappo-macos/releases) |
 | v0.0.1-Beta | 2026-10-28 | 首个开源版本：壳重建完成；修复 hit_region 字段解析（left/top）、KrSDK https 加载、计数持久化、WKWebView keep-alive、面板 1240×800 适配；修复退出时键盘重复刷屏（事件转发改为异步 channel） | — |
