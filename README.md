@@ -54,7 +54,7 @@
 
 ## 功能特性
 
-> 当前壳版本 **1.0.3-beta1**（跟随官方 1.0.3 前端资产；beta 后缀表示社区移植测试版）。可执行安装包见 [GitHub Releases](https://github.com/EchoAI-01/WuwaTappo-macos/releases)。
+> 当前壳版本 **1.0.3-beta2**（跟随官方 1.0.3 前端资产；beta 后缀表示社区移植测试版）。可执行安装包见 [GitHub Releases](https://github.com/EchoAI-01/WuwaTappo-macos/releases)。
 
 | 功能 | 状态 | 说明 |
 |---|---|---|
@@ -300,7 +300,7 @@ WuwaTappo-macos/
 
 | 键 | 当前值 | 说明 |
 |---|---|---|
-| `productName` / `version` | `WuwaTappo` / `1.0.3-beta1` | 壳版本跟随官方前端版本 + beta 后缀 |
+| `productName` / `version` | `WuwaTappo` / `1.0.3-beta2` | 壳版本跟随官方前端版本 + beta 后缀 |
 | `identifier` | `com.kuro.wuwatappo.cn` | 与官方一致；WebKit 数据目录 / TCC 展示名按此解析 |
 | `build.frontendDist` | `../frontend` | 编译期嵌入官方 dist |
 | `app.macOSPrivateApi` | `true` | 透明窗口等私有 API 必需 |
@@ -478,6 +478,7 @@ adhoc 签名产物未公证，他人首次打开需 **右键 → 打开**（绕�
 
 | 版本 | 日期 | 内容 | Release |
 |---|---|---|---|
+| 1.0.3-beta2 | 2026-11-04 | 修复 panel「登录」按钮无法拉起登录窗（根因：按钮处理先关 panel 自身窗口再开登录窗，窗口销毁杀死后续 JS；3 处自毁调用序改为先开登录窗再关面板）；ws 代理新增握手 rm/token 脱敏诊断行（宝箱 80013 房间绑定排查） | [v1.0.3-beta2](https://github.com/EchoAI-01/WuwaTappo-macos/releases/tag/v1.0.3-beta2) |
 | 1.0.3-beta1 | 2026-11-03 | 稳定性修复：根治其他应用全屏触发的崩溃（async 命令 tokio 线程裸 `setLevel:` → macOS 26+ 主线程断言，改同步命令 + 主线程守卫派发）；根治 toast 窗口幻影主应用（裸 index.html 命中默认路由 → 官方 `#/toast` 路由隔离），修复"给了权限也无法互动桌宠"与"退出全屏后所有窗口无法聚焦"双 bug；toast 恒穿透/不抢焦点，全屏化 fallback 按调用方门控 | [v1.0.3-beta1](https://github.com/EchoAI-01/WuwaTappo-macos/releases/tag/v1.0.3-beta1) |
 | 1.0.3-beta | 2026-11-02 | 跟随官方 1.0.3 前端：游戏模式（CGWindowList 全屏检测）、自定义快捷键（F7/F8/F9 可改键，全局触发 + 录入保护）、登录窗拖拽、新美术资源；4 项移植补丁全量平移 | [v1.0.3-beta](https://github.com/EchoAI-01/WuwaTappo-macos/releases) |
 | 1.0.1-beta | 2026-11-02 | 首个登录+联机全打通版本：cookie shim 登录态持久化、login-modal-open 补发与 intent 透传、NSWindow level 物理分层（桌宠恒置顶）、房间 socket.io 本地中继代理（Origin 白名单绕过）、auth 链防腰斩；发布版匿名化（路径重映射/诊断剥离） | [v1.0.1-beta](https://github.com/EchoAI-01/WuwaTappo-macos/releases) |

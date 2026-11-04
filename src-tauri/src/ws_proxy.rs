@@ -97,8 +97,21 @@ async fn handle_conn(client: TcpStream, peer: std::net::SocketAddr) {
     };
     // 日志脱敏：path_query 携带 infoToken 凭据，只记录 path 部分
     let path_only = path_query.split('?').next().unwrap_or("/socket.io/");
+    // 诊断（宝箱 80013 排查）：握手 query 的 rm 决定服务端房间绑定（rm=房间号 或
+    // 无房间时 userInfo.id 的 lobby 态）；token 脱敏只留前 8 字符。
+    // 启动恢复态与登录后态的 rm/token 差异是"重启需重登"假设的判据。
+    let q = path_query.split('?').nth(1).unwrap_or("");
+    let q_rm = q
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("rm="))
+        .unwrap_or("LOBBY-DEFAULT");
+    let q_tok = q
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("token="))
+        .map(|t| t.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "NONE".into());
     crate::dlog(&format!(
-        "[ws-proxy] relay established: {peer} -> {TARGET_HOST}{path_only} (upstream {})",
+        "[ws-proxy] relay established: {peer} -> {TARGET_HOST}{path_only} rm={q_rm} token={q_tok}.. (upstream {})",
         resp.status()
     ));
 
